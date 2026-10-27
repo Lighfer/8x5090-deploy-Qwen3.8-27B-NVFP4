@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""用合成请求检查固定推理入口；不读取业务请求，不创建平台凭据。"""
+import argparse
+import base64
+import concurrent.futures
+import datetime
+import json
+from pathlib import Path
+import struct
+import time
+import urllib.error
+import urllib.request
+import zlib
+
+BENCHMARK_TOKEN = None
+BENCHMARK_HEADER = 'X-GPUStack-Benchmark'
+
+
+def request(base, path, data=None):
+    """使用标准库发送请求，并保留失败状态，便于区分协议错误与生成错误。"""
+    body = None if data is None else json.dumps(data).encode()
+    headers = {"Content-Type": "application/json"}
+    if BENCHMARK_TOKEN:
+        headers[BENCHMARK_HEADER] = BENCHMARK_TOKEN
+    req = urllib.request.Request(base + path, data=body, headers=headers)
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=600) as response:
+            return response.status, response.read().decode(), round(time.monotonic() - started, 3)
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode(), round(time.monotonic() - started, 3)
+
+
+def png_url(rgb, size=512):
+    """生成单色测试图片；图片完全由固定像素组成，不使用业务文件。"""
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    pixels = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
+    data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+    data += chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b"")
+    return "data:image/png;base64," + base64.b64encode(data).decode()
+
+
+
+def private_output(value):
+    """运行结果只写到私有目录；显式指定输出也不能写回源码仓库。"""
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path(@@ROOT_PY@@) / path
+    config = json.loads((Path(@@ROOT_PY@@) / 'switch-config.json').read_text())
+    repository = Path(config['source_repository']).resolve()
+    if path.is_symlink() or path.resolve().is_relative_to(repository):
+        raise ValueError('运行结果不能写入源码仓库')
+    return str(path)
+
+
+
+def main():
+    global BENCHMARK_TOKEN, BENCHMARK_HEADER
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base", default=@@ENTRY_URL_PY@@)
+    parser.add_argument("--model", default=@@MODEL_NAME_PY@@)
+    parser.add_argument("--output", default="deployment-verification.json")
+    credentials = parser.add_mutually_exclusive_group()
+    credentials.add_argument("--token-file")
+    credentials.add_argument("--switch-state", help='读取当前私有切换状态，不在命令行传递维护值')
+    args = parser.parse_args()
+    if getattr(args, 'output', None): args.output = private_output(args.output)
+    if args.token_file:
+        BENCHMARK_TOKEN = Path(args.token_file).read_text().strip()
+    if args.switch_state:
+        # 普通接口测试与事务维护使用不同头；仅切换执行器传入其私有状态文件。
+        BENCHMARK_TOKEN = json.loads(Path(args.switch_state).read_text())['gate_token']
+        BENCHMARK_HEADER = 'X-GPUStack-Switch'
+    results = []
+
+    def record(name, passed, status, seconds, **detail):
+        item = dict(name=name, passed=bool(passed), status=status, seconds=seconds, **detail)
+        results.append(item)
+        print(json.dumps(item, ensure_ascii=False), flush=True)
+
+    def chat(messages, **extra):
+        # 功能探测关闭思考以控制耗时；默认 xhigh 另有独立探测，避免用短输出冒充完整推理。
+        return dict(model=args.model, messages=messages, max_tokens=128, temperature=0,
+                    chat_template_kwargs={"enable_thinking": False}, **extra)
+
+    status, text, seconds = request(args.base, "/health")
+    record("健康检查", status == 200, status, seconds)
+    status, text, seconds = request(args.base, "/v1/models")
+    models = json.loads(text) if status == 200 else {}
+    record("OpenAI模型列表格式", status == 200 and models.get("object") == "list" and
+           any(x.get("id") == args.model for x in models.get("data", [])), status, seconds)
+    status, text, seconds = request(args.base, "/metrics")
+    record("原vLLM指标", status == 200 and "vllm:" in text, status, seconds,
+           metric_lines=sum(1 for line in text.splitlines() if line.startswith("vllm:")))
+    for path in ["/v2/users", "/workers"]:
+        status, text, seconds = request(args.base, path)
+        record("管理路径拒绝" + path, status == 404, status, seconds)
+
+    status, text, seconds = request(args.base, "/v1/chat/completions", chat([
+        {"role": "user", "content": "部署验证，请只回复：运行正常。"}]))
+    data = json.loads(text) if status == 200 else {}
+    message = data.get("choices", [{}])[0].get("message", {})
+    record("文本生成", status == 200 and bool(message.get("content")), status, seconds,
+           output=message.get("content"), usage=data.get("usage"))
+
+    status, text, seconds = request(args.base, "/v1/chat/completions", chat([
+        {"role": "user", "content": "部署验证，请只回复：流式正常。"}], stream=True))
+    chunks = [json.loads(line[6:]) for line in text.splitlines()
+              if line.startswith("data: ") and line[6:] != "[DONE]"] if status == 200 else []
+    # JSON 可以将中文编码为 Unicode 转义，必须先解析再拼接内容，不能在原始 SSE 中直接查中文。
+    streamed = "".join(choice.get("delta", {}).get("content") or ""
+                       for chunk in chunks for choice in chunk.get("choices", []))
+    record("Chat流式完整结束", status == 200 and "data: [DONE]" in text and "流式" in streamed,
+           status, seconds, output=streamed)
+
+    # 不覆盖模板参数，核对真实默认仍启用思考；只限制探测输出长度，不改变服务默认值。
+    status, text, seconds = request(args.base, "/v1/chat/completions", {
+        "model": args.model, "messages": [{"role": "user", "content": "计算17乘以19。"}],
+        "max_tokens": 128, "temperature": 0})
+    data = json.loads(text) if status == 200 else {}
+    message = data.get("choices", [{}])[0].get("message", {})
+    record("默认思考模式", status == 200 and bool(message.get("reasoning") or message.get("reasoning_content")),
+           status, seconds, finish_reason=data.get("choices", [{}])[0].get("finish_reason"))
+
+    status, text, seconds = request(args.base, "/v1/chat/completions", {
+        "model": args.model, "messages": [{"role": "user", "content": "计算17乘以19。"}],
+        "reasoning_effort": "xhigh", "max_tokens": 128, "temperature": 0})
+    data = json.loads(text) if status == 200 else {}
+    record("显式xhigh透传", status == 200 and bool(data.get("choices")), status, seconds)
+
+    response_payload = dict(model=args.model, input="部署验证，请只回复：Responses正常。",
+                            max_output_tokens=128, temperature=0, chat_template_kwargs={"enable_thinking": False})
+    status, text, seconds = request(args.base, "/v1/responses", response_payload)
+    data = json.loads(text) if status == 200 else {}
+    record("Responses生成", status == 200 and data.get("status") == "completed" and bool(data.get("output")),
+           status, seconds)
+    status, text, seconds = request(args.base, "/v1/responses", dict(response_payload, stream=True))
+    record("Responses流式完整结束", status == 200 and "response.completed" in text, status, seconds)
+
+    tools = [{"type": "function", "function": {"name": "get_weather", "description": "查询指定城市的天气",
+             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+    tool_messages = [{"role": "user", "content": "请调用天气工具查询北京天气。"}]
+    payload = chat(tool_messages, tools=tools, tool_choice={"type": "function", "function": {"name": "get_weather"}})
+    status, text, seconds = request(args.base, "/v1/chat/completions", payload)
+    data = json.loads(text) if status == 200 else {}
+    message = data.get("choices", [{}])[0].get("message", {})
+    calls = message.get("tool_calls") or []
+    valid = bool(calls) and calls[0].get("function", {}).get("name") == "get_weather"
+    if valid:
+        valid = json.loads(calls[0]["function"]["arguments"]).get("city") == "北京"
+    record("工具调用参数", status == 200 and valid, status, seconds)
+    if valid:
+        tool_messages += [message, {"role": "tool", "tool_call_id": calls[0]["id"],
+                                   "content": '{"city":"北京","temperature_c":20,"weather":"晴"}'}]
+        status, text, seconds = request(args.base, "/v1/chat/completions", chat(tool_messages, tools=tools, tool_choice="none"))
+        data = json.loads(text) if status == 200 else {}
+        answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        record("工具结果回传", status == 200 and "20" in answer, status, seconds, output=answer)
+
+    for count in [1, 6]:
+        content = [{"type": "text", "text": "这些图片的主要颜色是什么？只用一个中文颜色词回答。"}]
+        content += [{"type": "image_url", "image_url": {"url": png_url((255, 0, 0))}} for _ in range(count)]
+        status, text, seconds = request(args.base, "/v1/chat/completions", chat([{"role": "user", "content": content}]))
+        data = json.loads(text) if status == 200 else {}
+        answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        record(str(count) + "张图片", status == 200 and "红" in answer, status, seconds, output=answer)
+
+    # 小规模并发只验证请求互不串扰及正常结束，不作为生产峰值吞吐或延迟结论。
+    def concurrent_probe(number):
+        marker = "部署核验编号" + str(number)
+        status, text, seconds = request(args.base, "/v1/chat/completions", chat([
+            {"role": "user", "content": "请严格只输出这段文字：" + marker}]))
+        data = json.loads(text) if status == 200 else {}
+        answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return dict(number=number, status=status, seconds=seconds, correct=marker in answer)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        concurrent_results = list(pool.map(concurrent_probe, range(8)))
+    record("四并发八请求", all(x["status"] == 200 and x["correct"] for x in concurrent_results),
+           200 if all(x["status"] == 200 for x in concurrent_results) else 0,
+           max(x["seconds"] for x in concurrent_results), requests=concurrent_results)
+
+    report = dict(at=datetime.datetime.now(datetime.timezone.utc).isoformat(), base=args.base,
+                  model=args.model, all_passed=all(x["passed"] for x in results), checks=results)
+    with open(args.output, "w", encoding="utf-8") as output:
+        json.dump(report, output, ensure_ascii=False, indent=2)
+    raise SystemExit(0 if report["all_passed"] else 1)
+
+
+if __name__ == "__main__":
+    main()

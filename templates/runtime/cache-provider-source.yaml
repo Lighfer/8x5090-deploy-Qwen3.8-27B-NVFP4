@@ -1,0 +1,700 @@
+- name: LMCache
+  display_name: LMCache
+  source: built_in
+  icon: /static/catalog_icons/lmcache.png
+  description:
+    default: LMCache is a KV cache layer for LLM serving. As a shared cache service
+      it runs a cache server on every worker; deployments and replicas on the same
+      node share KV cache through it, and a shared L2 storage backend extends the
+      reuse across nodes.
+    zh-CN: LMCache 是面向大模型推理的 KV Cache 层。作为共享缓存服务，它在每个 worker 上运行一个缓存服务端，同节点的部署与副本通过它共享
+      KV Cache，共享的 L2 存储后端把复用范围扩展到跨节点。
+  links:
+  - label:
+      default: Documentation
+      zh-CN: 文档
+    url: https://docs.lmcache.ai
+  - label: GitHub
+    url: https://github.com/LMCache/LMCache
+  topology: per_node
+  attach_locality: node_local
+  custom_version: true
+  runner_dependency: lmcache
+  runner_frameworks:
+  - cuda
+  components:
+    coordinator:
+      enabled_by: enable_p2p
+      gpu_access: false
+      common_parameters:
+      - --chunk-size
+      - --hash-algorithm
+      - --instance-timeout
+      - --health-check-interval
+      - --eviction-check-interval
+      - --eviction-ratio
+      - --trigger-watermark
+      - --metadata-path
+      - --checkpoint-path
+      - --checkpoint-interval
+      - --enable-blend-lookup
+      - --blend-probe-stride
+      - --timeout-keep-alive
+      - --disable-metrics
+      - --otlp-endpoint
+      - --extra-config
+      ports:
+      - port
+      run_command: lmcache coordinator --host {{host}} --port {{port}}
+      health_check:
+        scheme: http
+        path: /healthz
+    server:
+      topology: per_node
+      attach_endpoint: true
+      metrics_port: metrics
+      depends_on: coordinator
+      ports:
+      - name: port
+      - name: metrics
+      - name: p2p
+        enabled_by: enable_p2p
+        enabled_when: true
+      resource_profile:
+        ram_gib: '{{ram_size}}'
+        cpu: 2
+      run_command: lmcache server --host {{host}} --port {{port}} --l1-size-gb {{ram_size}}
+        --chunk-size {{chunk_size}} --http-host {{host}} --http-port {{metrics_port}}
+        --supported-transfer-mode auto --worker-reap-timeout-seconds 60 --eviction-policy
+        {{eviction_policy}} --eviction-trigger-watermark {{eviction_trigger_watermark}}
+        --eviction-ratio {{eviction_ratio}} --l1-align-bytes 65536 --coordinator-url
+        http://{{component.coordinator.address}} --coordinator-advertise-ip {{worker_ip}}
+        --p2p-advertise-url {{ports.p2p.url}}
+  resource_profile:
+    ram_gib: '{{ram_size}}'
+    cpu: 2
+  fields:
+  - name: ram_size
+    label:
+      default: RAM Size (GiB)
+      zh-CN: 内存容量（GiB）
+    description:
+      default: Cache capacity held in the cache server's memory.
+      zh-CN: 缓存服务端在内存中保留的缓存容量。
+    type: number
+    required: true
+    default: 20
+    min: 1
+    step: 1
+  - name: eviction_policy
+    label:
+      default: Eviction Policy
+      zh-CN: 淘汰策略
+    default: LRU
+    options:
+    - LRU
+    - IsolatedLRU
+    - noop
+    description:
+      default: Controls L1 memory cache eviction independently of L2 storage. LRU
+        evicts least-recently-used chunks. IsolatedLRU keeps one LRU list per cache
+        salt and requires per-salt quotas via the HTTP API. noop never evicts.
+      zh-CN: 控制 L1 内存缓存的淘汰，不影响 L2 存储。 LRU 淘汰最近最少使用的分块。IsolatedLRU 为每个 cache salt 维护独立的
+        LRU 列表，并需通过 HTTP API 为每个 salt 设置配额。noop 从不淘汰。
+  - name: eviction_trigger_watermark
+    label:
+      default: Eviction Trigger Watermark
+      zh-CN: 淘汰触发水位
+    type: number
+    default: 0.85
+    min: 0
+    max: 1
+    step: 0.05
+    description:
+      default: Memory usage fraction (0-1) that triggers eviction.
+      zh-CN: 触发淘汰的内存使用率（0-1）。
+  - name: eviction_ratio
+    label:
+      default: Eviction Ratio
+      zh-CN: 淘汰比例
+    type: number
+    default: 0.1
+    min: 0
+    max: 1
+    step: 0.05
+    description:
+      default: Fraction of memory (0-1) evicted per trigger.
+      zh-CN: 每次触发所淘汰的内存比例（0-1）。
+  - name: chunk_size
+    label:
+      default: Chunk Size
+      zh-CN: 分块大小
+    description:
+      default: Tokens per KV cache chunk. Smaller chunks reuse at finer granularity
+        but cost more overhead; empty uses the engine default.
+      zh-CN: 每个 KV Cache 分块包含的 token 数。分块越小，复用的粒度越细，开销也越大；留空则使用引擎的默认值。
+    type: number
+    min: 1
+    step: 1
+  - name: enable_p2p
+    label:
+      default: P2P Reads
+      zh-CN: P2P 读取
+    description:
+      default: Let each cache server read chunks from its peers instead of recomputing
+        them, turning the per-node caches into one pool. Brings up a coordinator component
+        for peer discovery.
+      zh-CN: 让每个缓存服务从对端读取数据块，而不是重新计算，把各节点的缓存合成一个池。 会额外运行一个 coordinator 组件用于节点发现。
+    type: boolean
+    default: false
+  l2_adapter_flag: --l2-adapter
+  l2_backends:
+    fs_native:
+      display_name:
+        default: Local Filesystem
+        zh-CN: 本地文件系统
+      description:
+        default: Spills KV cache to a local directory (e.g. NVMe) on the worker. Set
+          a positive target capacity and enable automatic cleanup to evict cached
+          data in the background. This is not a hard disk quota.
+        zh-CN: 将 KV Cache 溢出到 worker 上的本地目录（如 NVMe）。设置大于 0 的目标容量并 开启自动清理后，会在后台淘汰缓存。这不是磁盘硬配额。
+      fields:
+      - name: base_path
+        label:
+          default: Base Path
+          zh-CN: 基础路径
+        required: true
+        default: /var/lib/gpustack/cache/lmcache/l2
+      - name: max_capacity_gb
+        label:
+          default: Max Capacity (GiB)
+          zh-CN: 最大容量（GiB）
+        description:
+          default: Target capacity for cache tracked by this cache-server instance.
+            Usage can temporarily exceed this target. Set to 0 or leave empty to prevent
+            capacity-watermark-based automatic cleanup.
+          zh-CN: 当前缓存服务实例所统计缓存的目标容量，用量可能短时超过此目标。 填 0 或留空时，不会触发基于容量水位的自动清理。
+        type: number
+      - name: auto_cleanup
+        label:
+          default: Automatic Cleanup
+          zh-CN: 自动清理
+        description:
+          default: Requires a positive target capacity. Evicts least-recently-used
+            L2 cache using LMCache's default watermark and eviction ratio, independently
+            of L1 eviction. When disabled, capacity is only used for usage tracking
+            and storage usage can keep growing.
+          zh-CN: 需设置大于 0 的目标容量。使用 LMCache 默认水位和淘汰比例，按 LRU 清理 L2 缓存，独立于 L1 淘汰配置。关闭后容量仅用于用量统计，存储占用可能持续增长。
+        type: boolean
+        default: true
+        enabled_adapter_options:
+          eviction:
+            eviction_policy: LRU
+      - name: num_workers
+        label:
+          default: I/O Workers
+          zh-CN: I/O 工作线程
+        description:
+          default: Threads the connector reads and writes with, which is its effective
+            I/O queue depth. Raise it on storage whose total bandwidth exceeds what
+            a single stream reaches (a parallel filesystem such as GPFS or Lustre);
+            leave empty for a local disk, where the connector's own default serves.
+          zh-CN: 连接器读写所用的线程数，也就是它实际的 I/O 队列深度。当存储的总带宽高于单流带宽时（如 GPFS、Lustre 等并行文件系统）可以调高；本地磁盘留空即可，连接器自带的默认值足够。
+        type: number
+      - name: use_odirect
+        label:
+          default: Direct I/O (O_DIRECT)
+          zh-CN: 直接 I/O（O_DIRECT）
+        description:
+          default: Bypasses the page cache, so reads and writes hit the disk itself.
+            Takes effect only while each chunk is a multiple of the filesystem block
+            size — otherwise that transfer silently falls back to buffered I/O. Leave
+            off unless you are measuring real disk bandwidth.
+          zh-CN: 绕过页缓存，直接读写磁盘。 仅当数据块的字节数是文件系统块大小的整数倍时才真正生效，否则该次传输会静默回退为带缓存的 I/O。 除非要测量真实磁盘带宽，否则保持关闭。
+        type: boolean
+    resp:
+      display_name: Redis / Valkey
+      icon: /static/catalog_icons/redis.svg
+      description:
+        default: Shared L2 in a Redis or Valkey server; cache survives cache-server
+          restarts.
+        zh-CN: 以 Redis 或 Valkey 服务端作为共享 L2；缓存服务端重启后缓存仍然保留。
+      fields:
+      - name: host
+        label:
+          default: Host
+          zh-CN: 主机
+        required: true
+      - name: port
+        label:
+          default: Port
+          zh-CN: 端口
+        type: number
+        required: true
+      - name: username
+        label:
+          default: Username
+          zh-CN: 用户名
+        env_name: LMCACHE_RESP_USERNAME
+      - name: password
+        label:
+          default: Password
+          zh-CN: 密码
+        type: password
+        env_name: LMCACHE_RESP_PASSWORD
+      - name: max_capacity_gb
+        label:
+          default: Max Capacity (GiB)
+          zh-CN: 最大容量（GiB）
+        description:
+          default: Target capacity for cache tracked by this cache-server instance,
+            not the Redis/Valkey server-wide memory limit. Usage can temporarily exceed
+            this target. Set to 0 or leave empty to prevent capacity-watermark-based
+            automatic cleanup.
+          zh-CN: 当前缓存服务实例所统计缓存的目标容量，不是 Redis/Valkey 服务端的总内存上限。 用量可能短时超过此目标。填 0 或留空时，不会触发基于容量水位的自动清理。
+        type: number
+      - name: auto_cleanup
+        label:
+          default: Automatic Cleanup
+          zh-CN: 自动清理
+        description:
+          default: Requires a positive target capacity. Evicts least-recently-used
+            L2 cache using LMCache's default watermark and eviction ratio, independently
+            of L1 eviction. When disabled, capacity is only used for usage tracking
+            and storage usage can keep growing.
+          zh-CN: 需设置大于 0 的目标容量。使用 LMCache 默认水位和淘汰比例，按 LRU 清理 L2 缓存，独立于 L1 淘汰配置。关闭后容量仅用于用量统计，存储占用可能持续增长。
+        type: boolean
+        default: true
+        enabled_adapter_options:
+          eviction:
+            eviction_policy: LRU
+    s3:
+      display_name: S3
+      icon: /static/catalog_icons/s3.svg
+      description:
+        default: Shared L2 in an S3-compatible object store (AWS S3, MinIO, Ceph RGW).
+          The endpoint uses virtual-hosted style — the bucket name is part of the
+          host, e.g. "kvcache.s3.example.com"; path-style addressing is not supported.
+          Set a positive target capacity and enable automatic cleanup to evict cached
+          data in the background. This is not a bucket-wide storage quota.
+        zh-CN: 以兼容 S3 的对象存储作为共享 L2（AWS S3、MinIO、Ceph RGW）。地址采用 virtual-hosted 风格——bucket
+          名是主机名的一部分，例如 "kvcache.s3.example.com"；不支持 path-style 寻址。设置大于 0 的目标容量并 开启自动清理后，会在后台淘汰缓存。这不是整个
+          bucket 的存储配额。
+      fields:
+      - name: s3_endpoint
+        label:
+          default: Bucket Endpoint
+          zh-CN: Bucket 地址
+        required: true
+      - name: s3_region
+        label:
+          default: Region
+          zh-CN: 区域
+        required: true
+      - name: aws_access_key_id
+        label: Access Key ID
+        env_name: AWS_ACCESS_KEY_ID
+      - name: aws_secret_access_key
+        label: Secret Access Key
+        type: password
+        env_name: AWS_SECRET_ACCESS_KEY
+      - name: disable_tls
+        label:
+          default: Disable TLS (HTTP Endpoint)
+          zh-CN: 禁用 TLS（HTTP 端点）
+        type: boolean
+      - name: max_capacity_gb
+        label:
+          default: Max Capacity (GiB)
+          zh-CN: 最大容量（GiB）
+        description:
+          default: Target capacity for cache tracked by this cache-server instance,
+            not a bucket-wide storage quota. Usage can temporarily exceed this target.
+            Set to 0 or leave empty to prevent capacity-watermark-based automatic
+            cleanup.
+          zh-CN: 当前缓存服务实例所统计缓存的目标容量，不是整个 bucket 的存储配额。 用量可能短时超过此目标。填 0 或留空时，不会触发基于容量水位的自动清理。
+        type: number
+      - name: auto_cleanup
+        label:
+          default: Automatic Cleanup
+          zh-CN: 自动清理
+        description:
+          default: Requires a positive target capacity. Evicts least-recently-used
+            L2 cache using LMCache's default watermark and eviction ratio, independently
+            of L1 eviction. When disabled, capacity is only used for usage tracking
+            and storage usage can keep growing.
+          zh-CN: 需设置大于 0 的目标容量。使用 LMCache 默认水位和淘汰比例，按 LRU 清理 L2 缓存，独立于 L1 淘汰配置。关闭后容量仅用于用量统计，存储占用可能持续增长。
+        type: boolean
+        default: true
+        enabled_adapter_options:
+          eviction:
+            eviction_policy: LRU
+  common_parameters:
+  - --l2-adapter
+  - --coordinator-url
+  - --p2p-advertise-url
+  - --separate-object-groups
+  - --max-workers
+  - --max-gpu-workers
+  - --max-cpu-workers
+  - --hash-algorithm
+  - --enable-segmented-prefix
+  - --shm-name
+  - --worker-reap-timeout-seconds
+  - --worker-registration-grace-seconds
+  - --l1-use-lazy
+  - --l1-init-size-gb
+  - --l1-align-bytes
+  - --l1-read-ttl-seconds
+  - --l1-write-ttl-seconds
+  - --gds-l1-path
+  - --gds-l1-use-direct-io
+  - --l1-devdax-path
+  - --l2-store-policy
+  - --l2-prefetch-policy
+  - --l2-prefetch-max-in-flight
+  - --metrics-sample-rate
+  - --disable-metrics
+  - --disable-logging
+  - --disable-observability
+  - --enable-tracing
+  - --otlp-endpoint
+  - --event-bus-queue-size
+  - --trace-level
+  - --trace-output
+  health_check:
+    scheme: http
+    path: /healthcheck
+    target: metrics
+  default_metrics:
+    path: /metrics
+    mappings:
+      hit_rate:
+        ratio:
+          numerator: lmcache_mp_lookup_hit_tokens_total
+          denominator: lmcache_mp_lookup_requested_tokens_total
+      l1_usage_bytes:
+        gauge: lmcache_mp_l1_memory_usage_bytes
+      l1_usage_ratio:
+        gauge: lmcache_mp_l1_usage_ratio
+        aggregate: avg
+      l2_usage_bytes:
+        gauge: lmcache_mp_l2_usage_bytes
+      lookup_tokens_per_second:
+        rate: lmcache_mp_lookup_requested_tokens_total
+    throughput:
+      l0_l1_store:
+        histogram_avg: lmcache_mp_l0_l1_store_throughput_GB_per_second
+      l0_l1_load:
+        histogram_avg: lmcache_mp_l0_l1_load_throughput_GB_per_second
+      l2_store:
+        histogram_avg: lmcache_mp_l2_store_throughput_GB_per_second
+      l2_load:
+        histogram_avg: lmcache_mp_l2_load_throughput_GB_per_second
+  inference_backend_integrations:
+  - backend: vLLM
+    frameworks:
+    - cuda
+    versions: '>=0.25.0'
+    injection:
+      env:
+        PYTHONHASHSEED: '0'
+      locality_params:
+        node_local:
+          mp_transfer_mode: auto
+      kv_transfer_config:
+        kv_connector: LMCacheMPConnector
+        kv_role: kv_both
+        kv_connector_extra_config:
+          lmcache.mp.host: tcp://{{host}}
+          lmcache.mp.port: '{{port}}'
+          lmcache.mp.mp_transfer_mode: '{{mp_transfer_mode}}'
+          lmcache.mp.eager_prefetch: true
+      args:
+      - --shutdown-timeout
+      - '20'
+  - backend: SGLang
+    frameworks:
+    - cuda
+    versions: '>=0.5.13'
+    injection:
+      env:
+        PYTHONHASHSEED: '0'
+      args:
+      - --enable-lmcache
+      - --lmcache-config-file
+      - /tmp/gpustack-lmcache-sgl.yaml
+      files:
+        /tmp/gpustack-lmcache-sgl.yaml: 'mp_host: "{{host}}"
+
+          mp_port: {{port}}
+
+          '
+- name: Mooncake
+  display_name: Mooncake
+  source: built_in
+  icon: /static/catalog_icons/mooncake.png
+  description:
+    default: Mooncake Store is a high-performance distributed KV cache pool for LLM
+      inference, built on Mooncake's Transfer Engine. It pools the CPU DRAM and SSD
+      of a GPU cluster and serves the reusable KV cache held there to every engine
+      in it, over TCP or RDMA.
+    zh-CN: Mooncake Store 是面向大模型推理的高性能分布式 KV Cache 池，构建在 Mooncake Transfer Engine
+      之上。它把 GPU 集群中的 CPU 内存与 SSD 汇聚成缓存池，集群内任意引擎都可通过 TCP 或 RDMA 复用其中的 KV Cache。
+  links:
+  - label:
+      default: Documentation
+      zh-CN: 文档
+    url: https://kvcache-ai.github.io/Mooncake/
+  - label: GitHub
+    url: https://github.com/kvcache-ai/Mooncake
+  inference_backend_integrations:
+  - backend: vLLM
+    frameworks:
+    - cuda
+  - backend: vLLM
+    frameworks:
+    - cann
+  unavailable_reason:
+    default: Available in GPUStack Enterprise
+    zh-CN: GPUStack 企业版可用
+- name: XSKY MeshFusion
+  display_name: XSKY MeshFusion
+  source: partner
+  icon: /static/catalog_icons/xsky.png
+  description:
+    default: XSKY MeshFusion is a KV cache layer for LLM serving. As a shared cache
+      service it runs a cache server on every worker; deployments and replicas on
+      the same node share KV cache through it, and a shared L2 storage backend (e.g.
+      XSKY's store) extends the reuse across nodes.
+    zh-CN: XSKY MeshFusion 是面向大模型推理的 KV Cache 层。作为共享缓存服务，它在每个 worker 上运行一个缓存服务端，同节点的部署与副本通过它共享
+      KV Cache，共享的 L2 存储后端（如 XSKY 的存储）把复用范围扩展到跨节点。
+  links:
+  - label:
+      default: Product Page
+      zh-CN: 产品主页
+    url: https://www.xsky.com
+  management_url: true
+  topology: per_node
+  attach_locality: node_local
+  custom_version: true
+  default_run_args: --host {{host}} --port {{port}} --l1-size-gb {{ram_size}} --chunk-size
+    {{chunk_size}} --http-host {{host}} --http-port {{metrics_port}} --eviction-policy
+    {{eviction_policy}} --eviction-trigger-watermark {{eviction_trigger_watermark}}
+    --eviction-ratio {{eviction_ratio}}
+  resource_profile:
+    ram_gib: '{{ram_size}}'
+    cpu: 2
+  fields:
+  - name: ram_size
+    label:
+      default: RAM Size (GiB)
+      zh-CN: 内存容量（GiB）
+    description:
+      default: Cache capacity held in the cache server's memory.
+      zh-CN: 缓存服务端在内存中保留的缓存容量。
+    type: number
+    required: true
+    default: 20
+    min: 1
+    step: 1
+  - name: eviction_policy
+    label:
+      default: Eviction Policy
+      zh-CN: 淘汰策略
+    default: LRU
+    options:
+    - LRU
+    - IsolatedLRU
+    - noop
+    description:
+      default: Controls L1 memory cache eviction independently of L2 storage. LRU
+        evicts least-recently-used chunks. IsolatedLRU keeps one LRU list per cache
+        salt and requires per-salt quotas via the HTTP API. noop never evicts.
+      zh-CN: 控制 L1 内存缓存的淘汰，不影响 L2 存储。 LRU 淘汰最近最少使用的分块。IsolatedLRU 为每个 cache salt 维护独立的
+        LRU 列表，并需通过 HTTP API 为每个 salt 设置配额。noop 从不淘汰。
+  - name: eviction_trigger_watermark
+    label:
+      default: Eviction Trigger Watermark
+      zh-CN: 淘汰触发水位
+    type: number
+    default: 0.85
+    min: 0
+    max: 1
+    step: 0.05
+    description:
+      default: Memory usage fraction (0-1) that triggers eviction.
+      zh-CN: 触发淘汰的内存使用率（0-1）。
+  - name: eviction_ratio
+    label:
+      default: Eviction Ratio
+      zh-CN: 淘汰比例
+    type: number
+    default: 0.1
+    min: 0
+    max: 1
+    step: 0.05
+    description:
+      default: Fraction of memory (0-1) evicted per trigger.
+      zh-CN: 每次触发所淘汰的内存比例（0-1）。
+  - name: chunk_size
+    label:
+      default: Chunk Size
+      zh-CN: 分块大小
+    description:
+      default: Tokens per KV cache chunk. Smaller chunks reuse at finer granularity
+        but cost more overhead; empty uses the engine default.
+      zh-CN: 每个 KV Cache 分块包含的 token 数。分块越小，复用的粒度越细，开销也越大；留空则使用引擎的默认值。
+    type: number
+    min: 1
+    step: 1
+  l2_adapter_flag: --l2-adapter
+  l2_backends:
+    xdfs:
+      display_name: XSKY MeshFusion Store
+      icon: /static/catalog_icons/xsky.png
+      adapter_flag_optional: true
+      adapter_flag_default: false
+      adapter_flag_label:
+        default: Enable L2 Adapter Flag
+        zh-CN: 启用 L2 适配器参数
+      description:
+        default: XSKY MeshFusion Store distributed storage as the L2 tier; capacity
+          and durability scale with the external storage cluster.
+        zh-CN: 企业级 KV Cache 扩展加速方案，激活 GPU 节点本地 DRAM 与 SSD 加速模型推理。基于端到端的 NVMe 技术，提供跨节点共享、本地优先读写、自动淘汰策略、主动保护
+          SSD 寿命等多种能力。
+      adapter_type: nixl_store_dynamic
+      adapter_backend: XDFS_KV
+      adapter_params:
+        conf: conf
+        params_file: params_file
+        tenant_id: tenant_id
+        max_capacity_gb: max_capacity_gb
+      fields:
+      - name: tenant_id
+        label:
+          default: Tenant ID
+          zh-CN: 租户 ID
+        default: nixl
+  common_parameters:
+  - --l2-adapter
+  - --coordinator-url
+  - --p2p-advertise-url
+  - --separate-object-groups
+  - --max-workers
+  - --max-gpu-workers
+  - --max-cpu-workers
+  - --hash-algorithm
+  - --enable-segmented-prefix
+  - --shm-name
+  - --worker-reap-timeout-seconds
+  - --worker-registration-grace-seconds
+  - --l1-use-lazy
+  - --l1-init-size-gb
+  - --l1-align-bytes
+  - --l1-read-ttl-seconds
+  - --l1-write-ttl-seconds
+  - --gds-l1-path
+  - --gds-l1-use-direct-io
+  - --l1-devdax-path
+  - --l2-store-policy
+  - --l2-prefetch-policy
+  - --l2-prefetch-max-in-flight
+  - --metrics-sample-rate
+  - --disable-metrics
+  - --disable-logging
+  - --disable-observability
+  - --enable-tracing
+  - --otlp-endpoint
+  - --event-bus-queue-size
+  - --trace-level
+  - --trace-output
+  health_check:
+    scheme: http
+    path: /healthcheck
+    target: metrics
+  default_metrics:
+    path: /metrics
+    mappings:
+      hit_rate:
+        ratio:
+          numerator: lmcache_mp_lookup_hit_tokens_total
+          denominator: lmcache_mp_lookup_requested_tokens_total
+      l1_usage_bytes:
+        gauge: lmcache_mp_l1_memory_usage_bytes
+      l1_usage_ratio:
+        gauge: lmcache_mp_l1_usage_ratio
+        aggregate: avg
+      l2_usage_bytes:
+        gauge: lmcache_mp_l2_usage_bytes
+      lookup_tokens_per_second:
+        rate: lmcache_mp_lookup_requested_tokens_total
+    throughput:
+      l0_l1_store:
+        histogram_avg: lmcache_mp_l0_l1_store_throughput_GB_per_second
+      l0_l1_load:
+        histogram_avg: lmcache_mp_l0_l1_load_throughput_GB_per_second
+      l2_store:
+        histogram_avg: lmcache_mp_l2_store_throughput_GB_per_second
+      l2_load:
+        histogram_avg: lmcache_mp_l2_load_throughput_GB_per_second
+  inference_backend_integrations:
+  - backend: vLLM
+    frameworks:
+    - cuda
+    versions: '>=0.25.0'
+    injection:
+      env:
+        PYTHONHASHSEED: '0'
+      locality_params:
+        node_local:
+          mp_transfer_mode: auto
+      kv_transfer_config:
+        kv_connector: LMCacheMPConnector
+        kv_connector_module_path: lmcache.integration.vllm.lmcache_mp_connector
+        kv_role: kv_both
+        kv_connector_extra_config:
+          lmcache.mp.host: tcp://{{host}}
+          lmcache.mp.port: '{{port}}'
+          lmcache.mp.mp_transfer_mode: '{{mp_transfer_mode}}'
+      args:
+      - --shutdown-timeout
+      - '20'
+  - backend: vLLM
+    frameworks:
+    - cann
+    versions: '>=0.25.0'
+    injection:
+      env:
+        PYTHONHASHSEED: '0'
+      locality_params:
+        node_local:
+          mp_transfer_mode: engine_driven
+      kv_transfer_config:
+        kv_connector: LMCacheMPConnector
+        kv_connector_module_path: lmcache.integration.vllm.lmcache_mp_connector
+        kv_role: kv_both
+        kv_connector_extra_config:
+          lmcache.mp.host: tcp://{{host}}
+          lmcache.mp.port: '{{port}}'
+          lmcache.mp.mp_transfer_mode: '{{mp_transfer_mode}}'
+      args:
+      - --shutdown-timeout
+      - '20'
+  - backend: SGLang
+    frameworks:
+    - cuda
+    versions: '>=0.5.13'
+    injection:
+      env:
+        PYTHONHASHSEED: '0'
+      args:
+      - --enable-lmcache
+      - --lmcache-config-file
+      - /tmp/gpustack-lmcache-sgl.yaml
+      files:
+        /tmp/gpustack-lmcache-sgl.yaml: 'mp_host: "{{host}}"
+
+          mp_port: {{port}}
+
+          '

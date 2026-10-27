@@ -1,0 +1,14 @@
+[Unit]
+Description=Update the legacy model endpoint from GPUStack Router state
+After=docker.service
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 @@ROOT_SYSTEMD@@/entrypoint/sync-upstream.py
+User=root
+TimeoutStartSec=25
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=@@ROOT_SYSTEMD@@/entrypoint
+MemoryMax=128M
+CPUQuota=50%

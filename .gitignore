@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+site.json
+*-private.json
+*.log
+*.zip
+*.safetensors
+*.whl
+*.deb

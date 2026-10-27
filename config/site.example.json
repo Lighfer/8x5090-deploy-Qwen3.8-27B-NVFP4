@@ -1,0 +1,54 @@
+{
+  "format": 1,
+  "host": {
+    "address": null,
+    "interface": null,
+    "kind": null
+  },
+  "paths": {
+    "deployment": null,
+    "model_parent": null,
+    "model_directory": null
+  },
+  "ports": {
+    "management": null,
+    "inference": null,
+    "worker_api": null,
+    "worker_metrics": null,
+    "service_start": null,
+    "service_end": null
+  },
+  "names": {
+    "project": null,
+    "server": null,
+    "worker": null,
+    "proxy": null,
+    "cluster": null,
+    "node": null,
+    "model": null,
+    "cache": null,
+    "server_volume": null,
+    "worker_volume": null,
+    "worker_label": null
+  },
+  "gpus": {
+    "eight_card_order": null,
+    "six_card_order": null
+  },
+  "resources": {
+    "cache_gib": null,
+    "minimum_free_gib": null
+  },
+  "images": {
+    "runtime": null,
+    "cache": null,
+    "router": null
+  },
+  "identity": {
+    "model_id": 0,
+    "worker_id": 0,
+    "cluster_id": 0
+  },
+  "admin_user": null,
+  "default_mode": null
+}

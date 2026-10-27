@@ -1,0 +1,36 @@
+{
+  "images": [
+    {
+      "reference": "gpustack/gpustack:v2.3.0",
+      "Os": "linux",
+      "Architecture": "amd64",
+      "RepoDigests": [
+        "gpustack/gpustack@sha256:3d2734fa430007131fabd67bcf0d6def17bced4c1379ad7da0935ed79e52980e"
+      ]
+    },
+    {
+      "reference": "gpustack/runtime:pause",
+      "Os": "linux",
+      "Architecture": "amd64",
+      "RepoDigests": [
+        "gpustack/runtime@sha256:e9622b01071c38e4fe1ca9822a3841feab630ae13ff5ad7f540f73771e56ae86"
+      ]
+    },
+    {
+      "reference": "gpustack/runtime:health",
+      "Os": "linux",
+      "Architecture": "amd64",
+      "RepoDigests": [
+        "gpustack/runtime@sha256:910a7bfa3149639a26a56e55dd5a511355f954ab3143582725f63517ede4bee2"
+      ]
+    },
+    {
+      "reference": "nginx@sha256:47928bf67eb62a1863cb08d9ecb52d3e704304ba614eaee17884204677702951",
+      "Os": "linux",
+      "Architecture": "amd64",
+      "RepoDigests": [
+        "nginx@sha256:47928bf67eb62a1863cb08d9ecb52d3e704304ba614eaee17884204677702951"
+      ]
+    }
+  ]
+}

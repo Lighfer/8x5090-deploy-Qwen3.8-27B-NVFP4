@@ -1,0 +1,12 @@
+[Unit]
+Description=Recover unfinished GPUStack model profile switch
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 @@ROOT_SYSTEMD@@/switch-pd.py --recover-pending
+TimeoutStartSec=2400
+
+[Install]
+WantedBy=multi-user.target

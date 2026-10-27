@@ -1,0 +1,136 @@
+{
+  "format": 1,
+  "repository": "nv-community/Qwen3.8-27B-NVFP4",
+  "source": "ModelScope",
+  "revision_policy": "每个文件固定为原下载器登记的完整40位revision，并额外校验固定SHA256",
+  "files": [
+    {
+      "path": "LICENSE",
+      "bytes": 11343,
+      "sha256": "50cbab8a892c5f2993b8c7351a99182507472def3b1374558308605d99b86b32",
+      "revision": "1c9efe97c08e43e676cc6ffdd94467ce11117061",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/1c9efe97c08e43e676cc6ffdd94467ce11117061/LICENSE"
+    },
+    {
+      "path": "README.md",
+      "bytes": 8976,
+      "sha256": "5155ae78be082b7a75731a0e71cb38df42a0671b5a825a69c48be5efaca33e49",
+      "revision": "84aa77f9e07fd56e6781b041e85d8ea25bfbc28b",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/84aa77f9e07fd56e6781b041e85d8ea25bfbc28b/README.md"
+    },
+    {
+      "path": "chat_template.jinja",
+      "bytes": 8952,
+      "sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+      "revision": "1d6d21fcb3260b13cf156fb484705a5b01a26890",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/1d6d21fcb3260b13cf156fb484705a5b01a26890/chat_template.jinja"
+    },
+    {
+      "path": "config.json",
+      "bytes": 87506,
+      "sha256": "71fa01bb64de20971045cd82a82c0ebb25a54e1b0a3f09ef23cf5479e9c54df8",
+      "revision": "36e4ee27d3da2eab9bd6127c9c26ac22ae07914a",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/36e4ee27d3da2eab9bd6127c9c26ac22ae07914a/config.json"
+    },
+    {
+      "path": "configuration.json",
+      "bytes": 73,
+      "sha256": "f888421726665e8a84b738eed42a64875aed79de8be7daade851ac8bf4c0cef9",
+      "revision": "a8bf3b834bb300b007c3450f81f6521c4f5a84cd",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/a8bf3b834bb300b007c3450f81f6521c4f5a84cd/configuration.json"
+    },
+    {
+      "path": "generation_config.json",
+      "bytes": 214,
+      "sha256": "8a3a817a9d330f6f9e62f048fe62a48594946c4a5c4cb314a8011316d5094986",
+      "revision": "ce0e40ec33a66349f537d187f185f1ebc5b548cf",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/ce0e40ec33a66349f537d187f185f1ebc5b548cf/generation_config.json"
+    },
+    {
+      "path": "hf_quant_config.json",
+      "bytes": 53760,
+      "sha256": "5f4aaa9e462ddb26a9790ab459eee69d100b9ade7541f0c86038e925c013f80b",
+      "revision": "bf91cd4a1a615a59db7ca970548abb765ae49ec7",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/bf91cd4a1a615a59db7ca970548abb765ae49ec7/hf_quant_config.json"
+    },
+    {
+      "path": "merges.txt",
+      "bytes": 3353259,
+      "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+      "revision": "d92b00f125a5bcfb9c9a1ebb4b0dcdf230c8fadc",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/d92b00f125a5bcfb9c9a1ebb4b0dcdf230c8fadc/merges.txt"
+    },
+    {
+      "path": "model-00001-of-00003.safetensors",
+      "bytes": 9965652544,
+      "sha256": "7d0fd155118901373eb0fd13ed3aae68f95be747bc205be72ebc41739c25ee80",
+      "revision": "0e2bb1f297f8469e71867aed2abb732540e1bb27",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/0e2bb1f297f8469e71867aed2abb732540e1bb27/model-00001-of-00003.safetensors"
+    },
+    {
+      "path": "model-00002-of-00003.safetensors",
+      "bytes": 9985757064,
+      "sha256": "98a7e9486baa860c792c9463a770cb9d017696bdd17606300a5b9334149f4c27",
+      "revision": "307495a329b41b937b95eeaf85afb37d07532690",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/307495a329b41b937b95eeaf85afb37d07532690/model-00002-of-00003.safetensors"
+    },
+    {
+      "path": "model-00003-of-00003.safetensors",
+      "bytes": 1970287672,
+      "sha256": "0506ad35dc21469708e7813bd76c592cef08bd0317b4a1fe899745ebe2435271",
+      "revision": "7157d42817758d5a3b17fafdaf7cd040face3936",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/7157d42817758d5a3b17fafdaf7cd040face3936/model-00003-of-00003.safetensors"
+    },
+    {
+      "path": "model.safetensors.index.json",
+      "bytes": 214866,
+      "sha256": "7aa103a2582b7d26631988de33dea19e8a308ee9c239e8e14feb374af30905e2",
+      "revision": "ff5ebfa4e9c740b0ff22d6bc2b9eb6d4f59cd699",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/ff5ebfa4e9c740b0ff22d6bc2b9eb6d4f59cd699/model.safetensors.index.json"
+    },
+    {
+      "path": "preprocessor_config.json",
+      "bytes": 390,
+      "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+      "revision": "0655decb752dfc4635f17c3686e6aac2f1925e52",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/0655decb752dfc4635f17c3686e6aac2f1925e52/preprocessor_config.json"
+    },
+    {
+      "path": "processor_config.json",
+      "bytes": 1191,
+      "sha256": "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1",
+      "revision": "313f4195b2e744c78e56cb2c09ec44e3f3eaf08f",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/313f4195b2e744c78e56cb2c09ec44e3f3eaf08f/processor_config.json"
+    },
+    {
+      "path": "tokenizer.json",
+      "bytes": 12809320,
+      "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+      "revision": "c1154296c66b0b6f7745e99655120ba30eeb7326",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/c1154296c66b0b6f7745e99655120ba30eeb7326/tokenizer.json"
+    },
+    {
+      "path": "tokenizer_config.json",
+      "bytes": 1121,
+      "sha256": "e5d078b00e6c1223b32444db8c1001dc71d86ceef8ee706b5bf084c3a43a1f9c",
+      "revision": "3cabb5c4a25c799421bac58d467d7adc7a875640",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/3cabb5c4a25c799421bac58d467d7adc7a875640/tokenizer_config.json"
+    },
+    {
+      "path": "video_preprocessor_config.json",
+      "bytes": 385,
+      "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+      "revision": "51365c4de362edfba5db5d836cf950e70e590d4c",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/51365c4de362edfba5db5d836cf950e70e590d4c/video_preprocessor_config.json"
+    },
+    {
+      "path": "vocab.json",
+      "bytes": 6722759,
+      "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+      "revision": "447866f29cc6fd637a70d9146f0895ffadd8843b",
+      "url": "https://modelscope.cn/models/nv-community/Qwen3.8-27B-NVFP4/resolve/447866f29cc6fd637a70d9146f0895ffadd8843b/vocab.json"
+    }
+  ],
+  "total_bytes": 21944971395,
+  "metadata_parsed_without_unpickling": true
+}

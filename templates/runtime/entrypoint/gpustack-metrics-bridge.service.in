@@ -1,0 +1,22 @@
+[Unit]
+Description=GPUStack read-only runtime metrics bridge
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 @@ROOT_SYSTEMD@@/entrypoint/metrics-bridge.py
+Restart=always
+RestartSec=2
+Environment=DOCKER_HOST=unix:///var/run/docker.sock
+Nice=10
+MemoryMax=256M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@@ROOT_SYSTEMD@@/entrypoint
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

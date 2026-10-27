@@ -1,0 +1,11 @@
+{
+  "vllm_base_digest": "vllm/vllm-openai@sha256:6b90105076216e861cd30fae8828efef9263a0399137b894289f3b6a685bf4ff",
+  "rust_sdk": "rust@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1",
+  "router_sdist_sha256": "b0f953025ca81694f5212d77e1e1201557175d1e45c54e3b3d41e6015324379c",
+  "previous_vllm_base_digest": "vllm/vllm-openai@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34",
+  "router_base_digest": "vllm/vllm-openai@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34",
+  "vllm_source_commit": "e4a5b5537344b103ed10de7764378ef09604ef3d",
+  "vllm_version": "0.32.1rc1.dev466+ge4a5b5537",
+  "flashinfer_patch_commit": "3821440929ee342fe9f939dbf5186c3e667a851c",
+  "flashinfer_page_sha256": "fc17d23801546d3f5d958897397266cba2fbff0efe68323f5bdd85531c89fd63"
+}

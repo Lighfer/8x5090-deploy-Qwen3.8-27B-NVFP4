@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""只读汇集指定 GPUStack 模型与共享缓存指标，保留原入口的 Decode vLLM 指标。"""
+import concurrent.futures
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import subprocess
+import time
+import urllib.request
+
+ROOT = Path(@@ENTRY_ROOT_PY@@)
+MODEL_ID = @@MODEL_ID@@
+WORKER_IP = @@HOST_PY@@
+WORKER_METRICS = @@WORKER_METRICS_URL_PY@@
+QUERY = '''import os,subprocess,json
+from pathlib import Path
+env=dict(os.environ,PGPASSWORD=Path('/var/lib/gpustack/postgres_root_pass').read_text().strip())
+sql="""SELECT json_build_object(
+ 'models',(SELECT coalesce(json_agg(row_to_json(t)),'[]') FROM
+   (SELECT id,role,worker_ip AS ip,port FROM model_instances WHERE model_id=@@MODEL_ID@@
+    AND role IN ('prefill','decode') AND lower(state::text)='running' AND deleted_at IS NULL) t),
+ -- 共享缓存随模型角色的真实关联发现，服务重建后不能继续绑定旧编号。
+ 'caches',(SELECT coalesce(json_agg(row_to_json(t)),'[]') FROM
+   (SELECT i.id,s.name,i.ports->>'metrics' AS port,s.config->'fields'->>'ram_size' AS gib
+    FROM cache_service_instances i JOIN cache_services s ON s.id=i.cache_service_id
+    WHERE i.cache_service_id IN (
+      SELECT (role->'extended_kv_cache'->>'cache_service_id')::integer
+      FROM models m, jsonb_array_elements(coalesce(m.roles::jsonb,'[]'::jsonb)) role
+      WHERE m.id=@@MODEL_ID@@ AND role->'extended_kv_cache'->>'enabled'='true'
+      AND role->'extended_kv_cache'->>'mode'='shared'
+      AND (role->'extended_kv_cache'->>'cache_service_id') ~ '^[0-9]+$'
+    ) AND i.worker_id=@@WORKER_ID@@ AND lower(i.state::text)='running'
+    AND i.deleted_at IS NULL AND s.deleted_at IS NULL) t))"""
+p=subprocess.run(['psql','-X','-h','127.0.0.1','-U','root','-d','gpustack','-At','-c',sql],
+ env=env,capture_output=True,text=True,check=True,timeout=10)
+print(p.stdout.strip())
+'''
+SAMPLE = re.compile(r'([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+(.+)')
+LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)=("(?:\\.|[^"\\])*")')
+
+
+def fetch(url):
+    """不转发模型凭据；所有地址限定为本机受管理端口。"""
+    # Worker 同时采集系统和 GPU 状态，可能超过一秒；运行时自身端点保持较短超时。
+    with urllib.request.urlopen(url, timeout=4 if url==WORKER_METRICS else 1.5) as response:
+        return response.read(16 * 1024 * 1024).decode()
+
+
+def labels(text):
+    return {key: json.loads(value) for key, value in LABEL.findall(text or '')}
+
+
+def discover():
+    result = subprocess.run(['docker','exec',@@SERVER_PY@@,'python','-c',QUERY],
+        capture_output=True,text=True,check=True,timeout=15)
+    targets = json.loads(result.stdout)
+    for model in targets['models']:
+        if model['ip'] != WORKER_IP or not 1024 <= int(model['port']) <= 65535:
+            raise ValueError('Unexpected model target')
+    for cache in targets['caches']:
+        if not 1024 <= int(cache['port']) <= 65535:
+            raise ValueError('Unexpected cache metrics target')
+    return targets
+
+
+def publish(content):
+    """每轮原子替换；采集器停止时保留的文件会被网关的时间戳校验识别为过期。"""
+    temporary = ROOT/'metrics.prom.new'
+    temporary.write_text(content)
+    temporary.chmod(0o644)
+    os.replace(temporary,ROOT/'metrics.prom')
+
+
+def collect(pool,targets):
+    jobs = [('worker',None,pool.submit(fetch,WORKER_METRICS))]
+    for model in targets['models']:
+        jobs.append(('model',model,pool.submit(fetch,f"http://{WORKER_IP}:{int(model['port'])}/metrics")))
+    for cache in targets['caches']:
+        jobs.append(('cache',cache,pool.submit(fetch,f"http://{WORKER_IP}:{int(cache['port'])}/metrics")))
+    lines = []
+    headers = set()
+    worker_ok = False
+    def append(line):
+        if line.startswith('#'):
+            if line in headers: return
+            headers.add(line)
+        lines.append(line)
+    for kind,target,job in jobs:
+        try:
+            body=job.result()
+        except Exception as error:
+            logging.warning('Metrics component unavailable: %s %s',kind,type(error).__name__)
+            continue
+        if kind=='worker':
+            worker_ok=True
+            for line in body.splitlines():
+                if line.startswith(('# HELP gpustack:', '# TYPE gpustack:')):
+                    append(line)
+                    continue
+                match=SAMPLE.fullmatch(line)
+                if not match or not match[1].startswith('gpustack:'):continue
+                values=labels(match[2])
+                if values.get('model_id',str(MODEL_ID))!=str(MODEL_ID):continue
+                append(line)
+        elif kind=='model':
+            identity=f'model_instance_id="{int(target["id"])}",role="{target["role"]}"'
+            for line in body.splitlines():
+                # 原有 vLLM 使用者继续只看到 Decode，避免旧的通用求和逻辑重复计入 P。
+                if target['role']=='decode' and line.startswith(('# HELP vllm:', '# TYPE vllm:')):
+                    append(line)
+                    continue
+                match=SAMPLE.fullmatch(line)
+                if not match or not match[1].startswith('vllm:'):continue
+                name,raw,value=match.groups()
+                if target['role']=='decode':
+                    existing=raw[1:-1] if raw else ''
+                    append(name+'{'+(existing+',' if existing else '')+identity+'} '+value)
+                if name=='vllm:cache_config_info':
+                    config=labels(raw)
+                    engine=config.get('engine','0')
+                    model_labels=identity+',engine='+json.dumps(engine)
+                    for label_name,suffix in [('kv_cache_size_tokens','tokens'),('kv_cache_memory_bytes','bytes')]:
+                        try:
+                            number=float(config[label_name])
+                            if not 0 <= number < float('inf'):continue
+                        except (KeyError,ValueError,TypeError):continue
+                        metric='gpustack_bridge:kv_cache_capacity_'+suffix
+                        append('# TYPE '+metric+' gauge')
+                        append(metric+'{'+model_labels+'} '+str(number))
+        elif kind=='cache':
+            identity='cache_service_instance_id='+json.dumps(str(target['id']))+',cache_service_name='+json.dumps(target['name'])
+            for line in body.splitlines():
+                if line.startswith(('# HELP lmcache_mp_', '# TYPE lmcache_mp_')):
+                    append(line)
+                    continue
+                match=SAMPLE.fullmatch(line)
+                if not match or not match[1].startswith('lmcache_mp_'):continue
+                name,raw,value=match.groups()
+                existing=raw[1:-1] if raw else ''
+                append(name+'{'+(existing+',' if existing else '')+identity+'} '+value)
+            try:
+                capacity=float(target['gib'])*1024**3
+                if 0 < capacity < float('inf'):
+                    name='gpustack_bridge:shared_cache_capacity_bytes'
+                    append('# TYPE '+name+' gauge')
+                    append(name+'{'+identity+',backend="dram",l1_tag="_default"} '+str(capacity))
+            except (TypeError,ValueError):pass
+    append('# TYPE gpustack_bridge:source_up gauge')
+    append('gpustack_bridge:source_up '+('1' if worker_ok else '0'))
+    append('# TYPE gpustack_bridge:sample_timestamp_seconds gauge')
+    append('gpustack_bridge:sample_timestamp_seconds '+str(time.time()))
+    publish('\n'.join(lines)+'\n')
+
+
+def main():
+    logging.basicConfig(level=logging.WARNING,format='%(asctime)s %(levelname)s %(message)s')
+    targets=None
+    next_discovery=0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        while True:
+            started=time.monotonic()
+            try:
+                if targets is None or started>=next_discovery:
+                    targets=discover()
+                    next_discovery=started+15
+                collect(pool,targets)
+            except Exception as error:
+                # 不发布新时间戳，旧数据会自然过期；下轮重新发现，防止数据库状态短暂变化后一直沿用旧目标。
+                logging.warning('Metrics collection failed: %s',type(error).__name__)
+                next_discovery=0
+            time.sleep(max(.05,1-(time.monotonic()-started)))
+
+
+if __name__=='__main__':
+    main()

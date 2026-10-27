@@ -1,0 +1,1327 @@
+#!/usr/bin/env python3
+"""管理模型的四种部署方案及启停；事务失败恢复原方案和启停状态，期间隔离外部生成。"""
+
+import argparse
+from collections import Counter
+from contextlib import contextmanager
+import copy
+import datetime
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import signal
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+# 防止运行维护工具在冻结版本和生产目录生成没有登记的字节码文件。
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parent
+MODES = ("1p1d-cache", "1p1d-no-cache", "2p2d-cache", "1p2d-6gpu-cache")
+# 每个角色独立记录副本数和张量并行卡数，六卡方案不能复用两侧副本相同的假设。
+MODE_SHAPES = {
+    "1p1d-cache": {"prefill": (1, 4), "decode": (1, 4)},
+    "1p1d-no-cache": {"prefill": (1, 4), "decode": (1, 4)},
+    "2p2d-cache": {"prefill": (2, 2), "decode": (2, 2)},
+    "1p2d-6gpu-cache": {"prefill": (1, 2), "decode": (2, 2)},
+}
+STOP_MARKER = "# gpustack-model-stopped"
+STOP_LINES = "            " + STOP_MARKER + "\n            return 503;\n"
+TERMINAL = {"committed", "unchanged", "rolled-back", "aborted"}
+JOB_PATTERN = re.compile(r"\d{8}T\d{6}-[a-f0-9]{8}")
+MARKER = "# gpustack-pd-switch:"
+PROFILE_FIELDS = (
+    "backend", "backend_version", "backend_parameters", "image_name", "run_command",
+    "env", "roles", "disaggregation", "extended_kv_cache", "speculative_config",
+    "distributed_inference_across_workers", "cpu_offloading", "gpu_selector",
+    "gpu_type_selector", "gather",
+)
+READ_ONLY = {
+    "id", "created_at", "updated_at", "deleted_at", "ready_replicas", "state",
+    "state_message", "role_status", "stale", "degradations", "restarting_since",
+    "has_stale_lora_instances", "cluster_name",
+}
+
+
+class SwitchError(RuntimeError):
+    """表示需要终止目标切换、进入恢复流程的可报告错误。"""
+
+
+def read_json(path):
+    """JSON 文件统一采用 UTF-8，避免中文日志依赖终端编码。"""
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def atomic_file(path, content, mode=0o600):
+    """先同步临时文件再原子替换，避免异常退出留下半份快照或半份入口配置。"""
+    path = Path(path)
+    temporary = path.with_name(path.name + ".new")
+    with temporary.open("w", encoding="utf-8") as output:
+        os.fchmod(output.fileno(), mode)
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(path)
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def write_json(path, value):
+    """快照可能包含后端环境配置，仅允许 root 读取。"""
+    atomic_file(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def stamp():
+    """日志固定显示北京时间并保留 UTC 偏移，避免远端系统为 UTC 时产生八小时误差。"""
+    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).isoformat(timespec="seconds")
+
+
+@contextmanager
+def transaction_lock(root, blocking=False):
+    """所有入口共用同一个内核文件锁，不能并行修改模型或共享缓存。"""
+    parent = Path(root) / "baks/pd-switch"
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent.chmod(0o700)
+    with (parent / ".lock").open("a+") as lock:
+        os.chmod(lock.name, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError as error:
+            raise SwitchError("另一个切换或回滚正在执行；请运行 ./switch-pd.sh status 查看。") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def checked_job(root, identifier):
+    """只接受工具创建的事务名称，恢复操作不能跳出私有备份目录。"""
+    if not JOB_PATTERN.fullmatch(identifier):
+        raise SwitchError("切换记录编号不合法。")
+    parent = (Path(root) / "baks/pd-switch").resolve()
+    target = parent / identifier
+    if target.is_symlink() or target.resolve().parent != parent or not target.is_dir():
+        raise SwitchError("切换记录不存在或路径不安全。")
+    return target
+
+
+def payload(model):
+    """只去掉服务端状态字段，保留账户归属、访问策略及其他原有部署设置。"""
+    return {key: copy.deepcopy(value) for key, value in model.items() if key not in READ_ONLY}
+
+
+def cache_definition(service):
+    """重新创建缓存只发送公开创建字段，不能把旧编号、状态和实例带回平台。"""
+    return {key: copy.deepcopy(service[key]) for key in (
+        "name", "provider_name", "provider_version", "cluster_id", "worker_selector",
+        "restart_on_error", "config",
+    ) if key in service}
+
+
+def disabled_cache():
+    """显式关闭缓存并清空旧服务引用，避免继承顶层设置或阻止服务删除。"""
+    return {"enabled": False, "mode": "local", "cache_service_id": None}
+
+
+def unbind_cache(model):
+    """返回停止且解除全部共享缓存关联的模型对象，不直接修改传入快照。"""
+    value = payload(model)
+    value.update(replicas=0, restart_on_error=False, extended_kv_cache=disabled_cache())
+    for role in value.get("roles") or []:
+        role["extended_kv_cache"] = disabled_cache()
+    return value
+
+
+def parse_options(arguments):
+    """沿用已有验证器对 JSON 参数转义的处理，用语义值比较完整后端参数。"""
+    result = {}
+    index = 0
+    while index < len(arguments or []):
+        value = arguments[index]
+        index += 1
+        if not value.startswith("--"):
+            continue
+        name, separator, assigned = value.partition("=")
+        if not separator:
+            if index < len(arguments) and not arguments[index].startswith("--"):
+                assigned = arguments[index]
+                index += 1
+            else:
+                assigned = True
+        if isinstance(assigned, str) and assigned.startswith(("{", "[")):
+            try:
+                assigned = json.loads(assigned)
+            except json.JSONDecodeError:
+                assigned = json.loads(assigned.replace('\\"', '"'))
+        if name in result:
+            raise SwitchError("存在重复后端参数：" + name)
+        result[name] = assigned
+    return result
+
+
+def normal_entry(content):
+    """仅移除本工具固定格式的停机条件；其他手工编辑不会被宽泛正则删除。"""
+    if STOP_MARKER in content and content.count(STOP_LINES) != 1:
+        raise SwitchError("停机入口格式不符，拒绝覆盖。")
+    return content.replace(STOP_LINES, "", 1)
+
+
+def stopped_entry(content):
+    """停止后在固定生成入口直接返回503；健康与指标入口继续供平台维护使用。"""
+    content = normal_entry(content)
+    anchor = "        location /v1/ {\n"
+    if content.count(anchor) != 1:
+        raise SwitchError("入口结构不符，不能设置停机条件。")
+    return content.replace(anchor, anchor + STOP_LINES, 1)
+
+
+def profile_signature(model):
+    """比较部署意图时忽略平台补出的空字段及动态缓存编号，保留每个角色的完整性能参数。"""
+    def clean(value):
+        if isinstance(value, dict):
+            return {k: clean(v) for k, v in value.items() if v is not None}
+        if isinstance(value, list):
+            return [clean(v) for v in value]
+        return value
+    def role_fields(value):
+        fields = ('name', 'replicas', 'backend', 'backend_version', 'image_name', 'run_command', 'env', 'gpu_selector')
+        result = {k: value.get(k) for k in fields}
+        result['backend_parameters'] = parse_options(value.get('backend_parameters'))
+        return clean(result)
+    result = {k: model.get(k) for k in PROFILE_FIELDS if k not in ('roles', 'extended_kv_cache', 'backend_parameters')}
+    result['backend_parameters'] = parse_options(model.get('backend_parameters'))
+    result['roles'] = sorted((role_fields(r) for r in model.get('roles') or []), key=lambda r: r['name'])
+    result = clean(result)
+    # 平台读取模型时会补出空的gather和显式关闭的顶层草稿配置；模板省略它们
+    # 表达相同的部署意图。仅移除这两种确切默认值，真实参数或启用状态仍保留比较。
+    # 后端参数中的MTP独立存在，仍由上方parse_options完整核对，不能因此被忽略。
+    if result.get('gather') == {}:
+        result.pop('gather')
+    if result.get('speculative_config') == {'enabled': False}:
+        result.pop('speculative_config')
+    return result
+
+
+def identify_mode(host, model):
+    """识别完整正式配置；升级过渡仅接受身份已核对的旧推理镜像。"""
+    signature = profile_signature(model)
+    cached = any((r.get('extended_kv_cache') or {}).get('enabled') for r in model.get('roles') or [])
+    profiles = {mode: read_json(host.root / 'switch-profiles' / (mode + '.json')) for mode in MODES}
+    for mode in MODES:
+        if signature == profile_signature(profiles[mode]):
+            if not model.get('replicas') or cached == (mode != '1p1d-no-cache'):
+                return mode
+    # 文件更新不会立即替换正在运行的引擎。只允许逐项登记的旧镜像跨越此过渡期，
+    # 否则更新模板后，旧引擎连stop都无法识别。除了顶层推理镜像，其余性能参数、
+    # 角色、路由镜像、显卡选择和缓存启用状态仍全部严格比较，不接受未知网页配置。
+    reference = model.get('image_name')
+    expected = host.config.get('previous_runtime_images', {}).get(reference)
+    if expected:
+        if host.config.get('image_ids', {}).get(reference) != expected:
+            raise SwitchError('旧推理镜像登记与镜像锁不一致，不能识别部署方案。')
+        actual = host.run(['docker', 'image', 'inspect', '--format', '{{.Id}}', reference], timeout=30).strip()
+        if actual != expected:
+            raise SwitchError('旧推理镜像标签的内容已变化，不能识别部署方案。')
+        for mode, profile in profiles.items():
+            compatible = copy.deepcopy(model)
+            compatible['image_name'] = profile.get('image_name')
+            if profile_signature(compatible) == profile_signature(profile):
+                if not model.get('replicas') or cached == (mode != '1p1d-no-cache'):
+                    return mode
+    raise SwitchError('当前模型与正式方案不一致，不能猜测要记住的启动方案。')
+
+
+def resolve_command(host, args):
+    """start读取上次成功状态，stop记录当前实际方案；普通切换参数保持兼容。"""
+    requested = getattr(args, 'requested_command', args.mode)
+    args.requested_command = requested
+    args.operation = requested if requested in ('start', 'stop') else 'switch'
+    if requested in ('start', 'stop'):
+        saved = host.root / 'model-state.json'
+        current = host.call('GET', '/v2/models/' + str(host.config['model_id']))
+        if requested == 'start' and saved.exists():
+            args.mode = read_json(saved).get('last_mode')
+        elif requested == 'start' and not current.get('replicas') and not saved.exists():
+            # 首次启动采用环境输入中明确选择的方案；后续启动使用成功记录。
+            args.mode = host.config['initial_mode']
+        elif not current.get('replicas') and saved.exists():
+            args.mode = read_json(saved).get('last_mode')
+        else:
+            args.mode = identify_mode(host, current)
+        if args.mode not in MODES:
+            raise SwitchError('没有合法的上次部署方案，请显式指定一种方案启动。')
+    return args
+
+
+class Host:
+    """封装实际管理接口、进程和网络操作，测试时用隔离实现替换这些边界。"""
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.config = read_json(self.root / "switch-config.json")
+        spec = importlib.util.spec_from_file_location("gpustack_switch_local_api", self.root / "gpustack-local-api.py")
+        self.api = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.api)
+
+    def call(self, method, route, body=None):
+        """沿用本机短期管理员会话，不在脚本、命令行或日志中保存密码和令牌。"""
+        return self.api.call(method, route, body)
+
+    def optional(self, route):
+        """仅将真正的 404 解释为不存在，管理端故障不能误当成资源已经删除。"""
+        try:
+            return self.call("GET", route)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return None
+            raise
+
+    def run(self, arguments, timeout=60):
+        """命令使用参数数组，不经 shell 展开；调用方不会传入认证凭据。"""
+        result = subprocess.run(arguments, capture_output=True, text=True, timeout=timeout)
+        if result.returncode:
+            raise SwitchError("命令失败：" + " ".join(arguments[:4]) + "；" + result.stderr[-1200:])
+        return result.stdout
+
+    def container_logs(self, name, since):
+        """合并Docker日志的两个输出流，保留启动故障；快照目录仅root可读。"""
+        result = subprocess.run(['docker', 'logs', '--timestamps', '--since', since, '--tail', '2000', name],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20)
+        return result.stdout
+
+    def request(self, path, body=None, token=None, base=None, timeout=15):
+        """保留 HTTP 状态，验证请求通过临时随机条件，不向其他客户端开放生成。"""
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["X-GPUStack-Switch"] = token
+        request = urllib.request.Request((base or self.config["entry_url"]) + path,
+            data=json.dumps(body, ensure_ascii=False).encode() if body is not None else None,
+            headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode()
+
+    def sleep(self, seconds):
+        """轮询之间让出执行时间；每次等待均短于一分钟。"""
+        time.sleep(seconds)
+
+    def memory(self):
+        """读取 LXC 提供的实际内存余量和 cgroup OOM 计数，不以宿主总内存估算。"""
+        values = {line.split(":", 1)[0]: int(line.split()[1]) * 1024
+            for line in Path("/proc/meminfo").read_text().splitlines()
+            if line.startswith(("MemTotal:", "MemAvailable:"))}
+        source = Path("/sys/fs/cgroup/memory.events")
+        values["events"] = dict((name, int(value)) for name, value in
+            (line.split() for line in source.read_text().splitlines())) if source.exists() else {}
+        return values
+
+    def boot_id(self):
+        """内核启动编号用于区分正常任务中断和整机重启，不能把后者的服务重启误判为脚本破坏。"""
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+    def containers(self):
+        """读取当前容器；平台并行删除旧实例时，仅跳过已经确认消失的容器。"""
+        identifiers = self.run(["docker", "ps", "-q"]).split()
+        result = []
+        for identifier in identifiers:
+            try:
+                result.extend(json.loads(self.run(["docker", "inspect", identifier])))
+            except SwitchError as error:
+                # ps与inspect不是原子操作，GPUStack可能恰好在两次读取之间删除本模型旧容器。
+                # 必须同时确认Docker报告对象不存在且新列表里已经没有它，不能吞掉服务故障或权限错误。
+                if 'no such object' not in str(error).lower():
+                    raise
+                if identifier in self.run(["docker", "ps", "-q"]).split():
+                    raise
+        return result
+
+    def inspect_proxy(self):
+        """入口容器必须已由既有部署创建；执行器不会创建替代入口或改端口。"""
+        return json.loads(self.run(["docker", "inspect", self.config["proxy_container"]]))[0]
+
+    def proxy_running(self):
+        return self.inspect_proxy()["State"]["Running"]
+
+    def reload_nginx(self):
+        """平滑重载保留在途连接，配置目录挂载能立即看到原子替换后的文件。"""
+        proxy = self.config["proxy_container"]
+        if not self.proxy_running():
+            self.run(["docker", "start", proxy])
+        self.run(["docker", "exec", proxy, "nginx", "-t", "-c", "/config/nginx.conf"])
+        self.run(["docker", "exec", proxy, "nginx", "-s", "reload", "-c", "/config/nginx.conf"])
+
+    def synchronize_entry(self):
+        """主动更新动态 Router 地址，不依赖定时器恰好在验证之前执行。"""
+        self.run([sys.executable, str(self.root / "entrypoint/sync-upstream.py")], timeout=60)
+
+    def parameters(self, job):
+        """调用已实测的逐实例验证器，检查完整参数及 GPU、PID 空间和缓存连接器。"""
+        output = Path(job) / "parameters.json"
+        self.run([sys.executable, str(self.root / "verify-live-parameters.py"),
+            "--output", str(output), "--export", str(Path(job) / "verified-model.json")], timeout=180)
+        report = read_json(output)
+        if not report.get("passed"):
+            raise SwitchError("实际参数与声明配置不一致。")
+        return {"passed": True, "instances": len(report["checks"]),
+                "all_gpus": report["gpu_assignment_complete_and_disjoint"]}
+
+
+class Switch:
+    """一份事务对应一次快照，恢复过程可以在主进程结束后独立重入。"""
+
+    def __init__(self, host, job):
+        self.host = host
+        self.root = host.root
+        self.config = host.config
+        self.job = Path(job)
+        self.state = read_json(self.job / "state.json")
+        self.model_route = "/v2/models/" + str(self.config["model_id"])
+
+    def event(self, message, **details):
+        """日志只有运行状态和合成探测结果，认证信息及真实请求正文不进入日志。"""
+        value = {"at": stamp(), "message": message, **details}
+        with (self.job / "events.jsonl").open("a", encoding="utf-8") as output:
+            output.write(json.dumps(value, ensure_ascii=False) + "\n")
+            os.fchmod(output.fileno(), 0o600)
+        print("[" + value["at"] + "] " + message + ("；原因：" + str(details["reason"]) if details.get("reason") else ""), flush=True)
+
+    def save(self, phase=None, **changes):
+        """在副作用前登记意图；恢复进程据此处理请求成功但响应尚未落盘的情况。"""
+        self.state.update(changes)
+        if phase:
+            self.state["phase"] = phase
+        self.state["updated_at"] = stamp()
+        write_json(self.job / "state.json", self.state)
+
+    def instances(self):
+        return self.host.call("GET", self.model_route + "/instances")["items"]
+
+    def owned_model(self, container):
+        """工作负载名称匹配完整模型及角色，不能波及其他模型或业务容器。"""
+        workload = (container.get("Config", {}).get("Labels") or {}).get("runtime.gpustack.ai/workload", "")
+        return re.fullmatch(re.escape(self.config["model_name"]) + r"-(prefill|decode|router)-[a-z0-9]+", workload) is not None
+
+    def owned_cache(self, container):
+        """此版本只管理 LMCache 单组件 server，避免按模糊名称删除其他缓存。"""
+        labels = container.get("Config", {}).get("Labels") or {}
+        workload = labels.get("runtime.gpustack.ai/workload", "")
+        return labels.get("type") == "cache-service" and re.fullmatch(
+            re.escape(self.config["cache_name"]) + r"-server-[a-z0-9]+", workload) is not None
+
+    def check_memory(self, minimum=True):
+        current = self.host.memory()
+        before = read_json(self.job / "memory-before.json")
+        if minimum and current["MemAvailable"] < self.config["minimum_free_gib"] * 1024 ** 3:
+            raise SwitchError("主内存余量不足 " + str(self.config["minimum_free_gib"]) + "GiB。")
+        if minimum and any(current["events"].get(key, 0) > before["events"].get(key, 0)
+            for key in ("oom", "oom_kill", "oom_group_kill")):
+            raise SwitchError("检测到新增 OOM，停止目标切换。")
+        return current
+
+    def gate_content(self):
+        """仅阻止新的生成请求，健康、指标、模型列表和已建立的流保持原处理方式。"""
+        original = (self.job / "nginx-running.conf").read_text()
+        anchor = "        location /v1/ {\n"
+        if original.count(anchor) != 1 or MARKER in original:
+            raise SwitchError("入口结构变化或存在旧维护条件，拒绝盲目修改。")
+        return original.replace(anchor, anchor + "            " + MARKER + self.job.name + "\n" +
+            '            if ($http_x_gpustack_switch != "' + self.state["gate_token"] + '") { return 503; }\n', 1)
+
+    def install_gate(self):
+        original = (self.job / "nginx-before.conf").read_text()
+        current = self.root / "entrypoint/nginx.conf"
+        wanted = self.gate_content()
+        if current.read_text() not in (original, wanted, stopped_entry((self.job / "nginx-running.conf").read_text())):
+            raise SwitchError("入口被其他操作修改，不能覆盖。")
+        self.save(gate_intent=True)
+        atomic_file(current, wanted, 0o644)
+        self.host.reload_nginx()
+        for _ in range(30):
+            if self.host.request("/v1/chat/completions", {})[0] == 503:
+                self.event("已暂停外部新生成请求，健康与指标接口仍可访问")
+                return
+            self.host.sleep(0.5)
+        raise SwitchError("入口隔离未生效。")
+
+    def restore_gate(self):
+        """只恢复本事务写入的配置；检测到其他修改时停止，而不是覆盖他人的改动。"""
+        current = self.root / "entrypoint/nginx.conf"
+        before = (self.job / "nginx-before.conf").read_text()
+        running = (self.job / "nginx-running.conf").read_text()
+        original = before if self.state['phase'] == 'rolling-back' else running
+        if current.read_text() not in (before, running, self.gate_content(), stopped_entry(running)):
+            raise SwitchError("入口出现其他修改，恢复操作已停止。")
+        atomic_file(current, original, 0o644)
+        self.host.reload_nginx()
+        if self.state['phase'] == 'rolling-back' and not read_json(self.job / 'model-before.json').get('replicas'):
+            # 从零部署失败时，原状态本来就是停止和503；不能要求停止模型返回生成参数错误。
+            # 已恢复原入口文件且重载成功，保留停止状态，后续可重新执行部署。
+            self.save(gate_restored=True)
+            self.event('原模型本来处于停止状态，已恢复原入口配置，模型继续保持停止')
+            return
+        # Nginx 重载是异步的，等待普通请求实际越过维护条件，再宣布恢复访问。
+        for _ in range(30):
+            if self.host.request("/v1/chat/completions", {})[0] in (400, 422):
+                break
+            self.host.sleep(0.5)
+        else:
+            raise SwitchError("入口重载后仍未恢复普通请求访问。")
+        self.save(gate_restored=True)
+
+    def drain(self):
+        """直接检查引擎计数，连续空闲后停止；故障或超时最多等待配置中的排空时限。"""
+        timeout = self.state["drain_timeout"]
+        self.event("等待在途请求结束，最长 " + str(timeout) + " 秒")
+        deadline = time.monotonic() + timeout
+        idle = 0
+        while time.monotonic() < deadline:
+            items = [i for i in self.instances() if i.get("role") in ("prefill", "decode")]
+            # 从已经停止的状态启动时没有可排空的引擎，实际容器也消失后无需空等120秒。
+            if not items and not any(self.owned_model(c) for c in self.host.containers()):
+                self.event("没有存活模型实例，无需等待排空")
+                return
+            active, readable = 0, bool(items)
+            for item in items:
+                try:
+                    if item.get("state") != "running":
+                        readable = False
+                        continue
+                    status, text = self.host.request("/metrics", base=endpoint(item), timeout=3)
+                    counts = [float(line.rsplit(" ", 1)[1]) for line in text.splitlines()
+                        if re.match(r"^vllm:num_requests_(running|waiting)(?:\{| )", line)]
+                    readable = readable and status == 200 and len(counts) >= 2
+                    active += sum(counts)
+                except (OSError, ValueError):
+                    readable = False
+            idle = idle + 1 if readable and active == 0 else 0
+            if idle >= 3:
+                self.event("引擎已连续空闲")
+                return
+            self.host.sleep(2)
+        self.event("排空时限已到，将停止本模型；未结束的旧请求会中断")
+
+    def stop_model(self):
+        """先写整组停止意图，再确认平台实例和实际容器均退出，保留 Worker 的 PID 空间。"""
+        current = self.host.call("GET", self.model_route)
+        if current.get("name") != self.config["model_name"]:
+            raise SwitchError("模型编号对应的名称已变化。")
+        stopping = payload(current)
+        stopping.update(replicas=0, restart_on_error=False)
+        self.save(model_mutation_intent=True)
+        self.host.call("PUT", self.model_route, stopping)
+        deadline = time.monotonic() + self.config["stop_timeout"]
+        while time.monotonic() < deadline:
+            if not self.instances() and not any(self.owned_model(c) for c in self.host.containers()):
+                self.host.call("PUT", self.model_route, unbind_cache(self.host.call("GET", self.model_route)))
+                self.event("模型整组已停止并解除缓存关联，Server 和 Worker 保持运行")
+                return
+            self.host.sleep(3)
+        raise SwitchError("模型未完全停止，不能重建缓存或启动另一方案。")
+
+    def owned_service(self):
+        services = self.host.call("GET", "/v2/cache-services")["items"]
+        candidates = [c for c in services if c["name"] == self.config["cache_name"]
+            and c.get("cluster_id") == self.state["cluster_id"]]
+        if len(candidates) > 1:
+            raise SwitchError("发现同名缓存，不能确定归属。")
+        return candidates[0] if candidates else None
+
+    def delete_cache(self):
+        """仅删除此模型独占且名称、集群匹配的池，等待实际退出后再申请另一份内存。"""
+        service = self.owned_service()
+        if service:
+            refs = self.host.call("GET", "/v2/cache-services/" + str(service["id"]) + "/models")["items"]
+            if refs:
+                raise SwitchError("缓存仍被模型引用，拒绝删除：" + ",".join(str(i["id"]) for i in refs))
+            self.save(cache_delete_intent=service["id"])
+            self.host.call("DELETE", "/v2/cache-services/" + str(service["id"]))
+        deadline = time.monotonic() + self.config["stop_timeout"]
+        while time.monotonic() < deadline:
+            if self.owned_service() is None and not any(self.owned_cache(c) for c in self.host.containers()):
+                self.event("旧缓存池已退出，锁页内存已交还系统")
+                return
+            self.host.sleep(3)
+        raise SwitchError("缓存仍未退出，不能同时创建两个专用内存池。")
+
+    def create_cache(self, definition, rollback=False):
+        """先登记创建意图，再提交；中断恢复可按独占名称找回尚未写入编号的新池。"""
+        if self.host.memory()["MemAvailable"] < (self.config["cache_gib"] + self.config["minimum_free_gib"] + 2) * 1024 ** 3:
+            raise SwitchError("缓存启动前可用内存不足，不能安全分配所选容量及启动余量。")
+        self.save(cache_create_intent=True)
+        service = self.host.call("POST", "/v2/cache-services", copy.deepcopy(definition))
+        self.save(cache_id=service["id"])
+        started = time.monotonic()
+        deadline = started + self.config["cache_timeout"]
+        notice = started + 30
+        while time.monotonic() < deadline:
+            self.check_memory(minimum=not rollback)
+            service = self.host.call("GET", "/v2/cache-services/" + str(service["id"]))
+            if service.get("state") == "running" and service.get("healthy") is True:
+                self.event("专用内存缓存池已健康，实际编号 " + str(service["id"]))
+                return service["id"]
+            if service.get("state") == "error":
+                raise SwitchError("缓存服务启动失败：" + str(service.get("state_message")))
+            if time.monotonic() >= notice:
+                self.event("内存缓存仍在启动，已等待 " + str(int(time.monotonic() - started)) + " 秒")
+                notice = time.monotonic() + 30
+            self.host.sleep(3)
+        raise SwitchError("缓存未在限定时间内健康。")
+
+    def target(self, cache_id):
+        """从原模型继承身份、权限和节点选择，替换经过固定验证的完整角色与后端配置。"""
+        model = payload(read_json(self.job / "model-before.json"))
+        profile = read_json(self.job / "target-profile.json")
+        for field in PROFILE_FIELDS:
+            model[field] = copy.deepcopy(profile.get(field))
+        for role in model["roles"]:
+            if role.get("worker_selector") is not None:
+                role["worker_selector"] = copy.deepcopy(model["worker_selector"])
+            role["extended_kv_cache"] = disabled_cache()
+            if role["name"] == "prefill" and cache_id is not None:
+                role["extended_kv_cache"] = {"enabled": True, "mode": "shared",
+                    "cache_service_id": cache_id, "chunk_size": self.config["chunk_size"]}
+        model.update(replicas=1, restart_on_error=True, extended_kv_cache=disabled_cache())
+        return model
+
+    def ready(self, model, rollback=False):
+        """要求全部副本与全部 Router 成员健康，不能以任意一个副本就绪替代整组就绪。"""
+        wanted = Counter({r["name"]: r["replicas"] for r in model["roles"]})
+        started = time.monotonic()
+        deadline = started + self.config["start_timeout"]
+        notice = started + 30
+        next_gpu_check = started
+        gpu_oom_seen = {}
+        last = None
+        errors = 0
+        while time.monotonic() < deadline:
+            memory = self.check_memory(minimum=not rollback)
+            items = self.instances()
+            if not rollback and time.monotonic() >= next_gpu_check:
+                # FlashInfer可跳过显存不足的调优候选并继续。只有未捕获OOM，或警告后三分钟仍未
+                # 就绪才回滚；不能因已恢复的调优警告终止健康加载。
+                for item in items:
+                    if item.get('role') not in ('prefill', 'decode'):
+                        continue
+                    log = self.host.container_logs(item['name'] + '-run-0', self.state['created_at'])
+                    if re.search(r'memory allocation failed with OOM|torch\.OutOfMemoryError|CUDA out of memory', log):
+                        atomic_file(self.job / ('gpu-oom-' + item['name'] + '.log'), log)
+                        if 'torch.OutOfMemoryError' in log and 'Traceback (most recent call last):' in log:
+                            raise SwitchError('候选实例发生未捕获GPU显存错误：' + item['name'])
+                        healthy = item.get('state') == 'running'
+                        if not healthy:
+                            try:
+                                healthy = self.host.request('/health', base=endpoint(item), timeout=2)[0] == 200
+                            except (OSError, ValueError):
+                                pass
+                        if healthy:
+                            gpu_oom_seen.pop(item['name'], None)
+                        else:
+                            gpu_oom_seen.setdefault(item['name'], time.monotonic())
+                            if time.monotonic() - gpu_oom_seen[item['name']] >= 180:
+                                raise SwitchError('GPU调优显存警告后三分钟仍未就绪：' + item['name'])
+                next_gpu_check = time.monotonic() + 30
+            brief = [(i["id"], i["role"], i["state"], i.get("state_message")) for i in items]
+            if brief != last:
+                self.event("加载进度：" + "; ".join(str(x[1]) + "=" + str(x[2]) for x in brief), instances=brief)
+                last = brief
+            errors = errors + 1 if any(i.get("state") == "error" for i in items) else 0
+            if errors >= 3:
+                raise SwitchError("模型实例持续报错，请查看本次加载记录。")
+            if time.monotonic() >= notice:
+                self.event("模型仍在加载，已等待 " + str(int(time.monotonic() - started)) + " 秒；可用内存 " +
+                    str(round(memory["MemAvailable"] / 1024 ** 3, 1)) + "GiB")
+                notice = time.monotonic() + 30
+            if Counter(i["role"] for i in items) == wanted and all(i["state"] == "running" for i in items):
+                try:
+                    if all(self.host.request("/health", base=endpoint(i), timeout=5)[0] == 200 for i in items):
+                        self.members(items)
+                        return items
+                except (OSError, ValueError, SwitchError):
+                    pass
+            self.host.sleep(5)
+        raise SwitchError("等待全部 P/D/Router 就绪超时。")
+
+    def members(self, items):
+        """逐地址检查 Router 注册表，避免 2P2D 只有一侧部分副本参与服务。"""
+        router = next(i for i in items if i["role"] == "router")
+        status, text = self.host.request("/workers", base=endpoint(router), timeout=8)
+        workers = json.loads(text).get("workers", []) if status == 200 else []
+        expected = {(i["role"], endpoint(i)) for i in items if i["role"] in ("prefill", "decode")}
+        healthy = {(w["worker_type"], w["url"].rstrip("/")) for w in workers
+            if w.get("is_healthy") is True and w.get("model_id") == self.config["model_name"]}
+        if healthy != expected:
+            raise SwitchError("Router 健康成员与全部 P/D 副本不一致。")
+        return {"passed": True, "members": len(healthy)}
+
+    def verify(self, model, rollback=False):
+        """先核对成员、进程和入口；默认再执行真实生成，显式健康检查模式不发送生成请求。"""
+        self.host.synchronize_entry()
+        token = self.state["gate_token"] if self.state.get("gate_intent") else None
+        items = self.ready(model, rollback=rollback)
+        results = {"members": self.members(items), "parameters": self.host.parameters(self.job)}
+        for path in ("/health", "/v1/models"):
+            status, text = self.host.request(path, token=token)
+            if status != 200:
+                raise SwitchError("入口检查失败：" + path + " HTTP " + str(status))
+            if path.endswith("models"):
+                data = json.loads(text)
+                if data.get("object") != "list" or self.config["model_name"] not in [m.get("id") for m in data.get("data", [])]:
+                    raise SwitchError("模型列表或模型名不正确。")
+        if self.state.get("health_only"):
+            # 健康检查适用于明确不开展推理测试的配置维护，不能把它记为图片、答案或吞吐验收。
+            # 就绪、全部成员、真实进程参数、内存和其他业务保护仍必须通过，回滚沿用相同边界。
+            results.update(verification_level="health_only", inference_requests_sent=0,
+                functional_inference_verified=False, protected_containers=self.protected(),
+                memory=self.check_memory(minimum=not rollback))
+            write_json(self.job / ("rollback-verification.json" if rollback else "verification.json"), results)
+            self.event("全部副本、实际参数、入口及内存健康检查通过；未进行推理测试")
+            return results
+        results["verification_level"] = "generation"
+        # 默认思考不做覆盖；限制探测输出长度不改变生产默认 xhigh。
+        data = {"model": self.config["model_name"], "messages": [{"role": "user", "content": "计算17+25，请给出结果。"}],
+                "max_tokens": 256, "temperature": 0}
+        started = time.monotonic()
+        status, text = self.host.request("/v1/chat/completions", data, token=token, timeout=180)
+        response = json.loads(text) if status == 200 else {}
+        choices = response.get("choices") or [{}]
+        message = choices[0].get("message") or {}
+        if status != 200 or "42" not in (message.get("content") or "") or not (message.get("reasoning") or message.get("reasoning_content")):
+            raise SwitchError("默认思考生成检查失败，或未得到正确答案。")
+        results["default_thinking_chat"] = {"passed": True, "seconds": round(time.monotonic() - started, 3), "usage": response.get("usage")}
+        data.update(stream=True, max_tokens=64, chat_template_kwargs={"enable_thinking": False})
+        status, text = self.host.request("/v1/chat/completions", data, token=token, timeout=120)
+        chunks = [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: ") and line[6:] != "[DONE]"] if status == 200 else []
+        answer = "".join(c.get("delta", {}).get("content") or "" for item in chunks for c in item.get("choices", []))
+        if status != 200 or "data: [DONE]" not in text or "42" not in answer:
+            raise SwitchError("流式生成检查失败。")
+        results["stream"] = {"passed": True}
+        status, text = self.host.request("/v1/responses", {"model": self.config["model_name"], "input": "计算17+25，只回复结果。",
+            "max_output_tokens": 64, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}, token=token, timeout=120)
+        response = json.loads(text) if status == 200 else {}
+        if status != 200 or response.get("status") != "completed" or "42" not in json.dumps(response.get("output"), ensure_ascii=False):
+            raise SwitchError("Responses 生成检查失败。")
+        results["responses"] = {"passed": True}
+        status, text = self.host.request('/v1/responses', {'model': self.config['model_name'],
+            'input': '计算17+25，只给出结果。', 'stream': True, 'max_output_tokens': 256,
+            'temperature': 0}, token=token, timeout=120)
+        events = [json.loads(line[6:]) for line in text.splitlines()
+            if line.startswith('data: ') and line[6:] != '[DONE]'] if status == 200 else []
+        event_types = sorted({item.get('type', '') for item in events})
+        streamed_answer = ''.join(item.get('delta', '') for item in events if item.get('type') == 'response.output_text.delta')
+        if status != 200 or 'response.completed' not in event_types or '42' not in streamed_answer or not any(
+            item.get('type') == 'response.reasoning_text.delta' and item.get('delta') for item in events):
+            raise SwitchError('Responses默认思考流式检查失败。')
+        # 新版标准化的是内容部分起止事件；文本增量名称不变，记录实际事件便于核对客户端兼容。
+        results['responses_default_thinking_stream'] = {'passed': True, 'event_types': event_types}
+        if self.state.get("extended_check") and not rollback:
+            # 保留采样阶段的卡号和进程；CPU冷启动验收之后的最终进程可能已经变化。
+            write_json(self.job / 'parameters-before-extended.json', read_json(self.job / 'parameters.json'))
+            # 扩展验证读取本次私有快照中的维护条件，不把临时通行值放到命令行。
+            # 只在明确选择扩展验证时执行；普通生产切换仍使用上面的短时功能检查。
+            self.event("开始隔离条件下的上下文、并发和缓存扩展验证")
+            if self.state['target'] == '1p1d-cache':
+                self.host.run([sys.executable, str(self.root / 'verify-model-features.py'),
+                    '--base', self.config['entry_url'], '--model', self.config['model_name'],
+                    '--output', str(self.job / 'features.json'), '--switch-state', str(self.job / 'state.json')], timeout=600)
+                if not read_json(self.job / 'features.json').get('all_passed'):
+                    raise SwitchError('图片、工具及接口功能回归未通过。')
+            self.host.run([sys.executable, str(self.root / "verify-v032-migration.py"),
+                "--job", str(self.job)], timeout=900)
+            extended = read_json(self.job / "extended-verification.json")
+            if not extended.get("passed"):
+                raise SwitchError("扩展验证未通过，不能开放目标服务。")
+            results["extended"] = {"passed": True, "file": "extended-verification.json"}
+            # 内存读回验收可能保留CPU池并重启整组模型；重新确认最终实例，不能沿用重启前的端口和进程。
+            self.host.synchronize_entry()
+            items = self.ready(model, rollback=rollback)
+            results["members"] = self.members(items)
+            results["parameters"] = self.host.parameters(self.job)
+        results["protected_containers"] = self.protected()
+        results["memory"] = self.check_memory(minimum=not rollback)
+        write_json(self.job / ("rollback-verification.json" if rollback else "verification.json"), results)
+        self.event("全部副本、实际参数、默认思考、流式及 Responses 均已验证")
+        return results
+
+    def protected(self):
+        """模型切换不能重新创建 Server、Worker 或其他既有运行中的业务容器。"""
+        before = read_json(self.job / "protected-before.json")
+        actual = {c["Name"].lstrip("/"): c for c in self.host.containers()}
+        for name, identity in before.items():
+            current = actual.get(name)
+            if not current or [current["Id"], current["State"]["StartedAt"], current["RestartCount"]] != identity:
+                raise SwitchError("受保护容器身份或启动状态发生变化：" + name)
+        return {"passed": True, "names": sorted(before)}
+
+    def rebase_after_reboot(self):
+        """整机重启后重新记录已运行容器的身份，旧记录单独保留，原模型和缓存快照不改写。"""
+        current_boot = self.host.boot_id()
+        previous_boot = self.state.get("boot_id")
+        if not previous_boot or current_boot == previous_boot or self.state.get("recovery_boot_id") == current_boot:
+            return
+        deadline = time.monotonic() + 300
+        required = {self.config['server_container'], self.config['worker_container'], self.config["proxy_container"]}
+        while True:
+            containers = self.host.containers()
+            available = {c["Name"].lstrip("/") for c in containers}
+            if required.issubset(available):
+                break
+            if time.monotonic() >= deadline:
+                raise SwitchError("整机重启后必需容器仍未运行，维护入口保持关闭。")
+            self.host.sleep(5)
+        original = self.job / "protected-before-previous-boot.json"
+        if not original.exists():
+            atomic_file(original, (self.job / "protected-before.json").read_text())
+        identities = {c["Name"].lstrip("/"): [c["Id"], c["State"]["StartedAt"], c["RestartCount"]]
+            for c in containers if not self.owned_model(c) and not self.owned_cache(c)}
+        write_json(self.job / "protected-before.json", identities)
+        self.save(recovery_boot_id=current_boot, recovered_after_reboot=True)
+        self.event("检测到整机重启，已记录本次启动后的服务身份，准备恢复未完成切换")
+
+    def publish_state(self):
+        """更新生产目录的导出，避免缓存重建后手工恢复文件仍引用已经删除的旧编号。"""
+        model = read_json(self.job / "verified-model.json")
+        changed = {}
+        for name in ("pd-model-live.json", "pd-model-live.yaml"):
+            changed[name] = model
+        stopped = copy.deepcopy(model)
+        stopped["replicas"] = 0
+        changed["pd-model-stopped.yaml"] = stopped
+        # 配比模板保持不绑定缓存；通用恢复模板才描述当前真实缓存编号。
+        for mode, name in (("1p1d-no-cache", "pd-model-1p1d-stopped.yaml"),
+                           ("2p2d-cache", "pd-model-2p2d-stopped.yaml"),
+                           ("1p2d-6gpu-cache", "pd-model-1p2d-6gpu-stopped.yaml")):
+            value = read_json(self.root / "switch-profiles" / (mode + ".json"))
+            value["worker_selector"] = copy.deepcopy(model.get("worker_selector"))
+            for role in value.get("roles") or []:
+                if role.get("worker_selector") is not None:
+                    role["worker_selector"] = copy.deepcopy(model.get("worker_selector"))
+            changed[name] = value
+        for name, value in changed.items():
+            if name.endswith(".yaml"):
+                # YAML 顶层保留普通键，值使用标准 JSON 流式语法；不依赖额外 YAML 库，
+                # 同时兼容现有验证器按顶层 name 行生成只读校验名称的逻辑。
+                text = "".join(key + ": " + json.dumps(item, ensure_ascii=False) + "\n" for key, item in value.items())
+                atomic_file(self.root / name, text)
+            else:
+                write_json(self.root / name, value)
+        sums = self.root / "SHA256SUMS"
+        if sums.exists():
+            updated = []
+            for line in sums.read_text().splitlines():
+                digest, separator, name = line.partition("  ")
+                if separator and name in changed:
+                    line = hashlib.sha256((self.root / name).read_bytes()).hexdigest() + "  " + name
+                updated.append(line)
+            atomic_file(sums, "\n".join(updated) + "\n", 0o644)
+        self.save(production_exports_updated=True)
+
+    def same_configuration(self, wanted):
+        """按完整参数语义识别同方案，健康时不做无意义的停机和缓存清空。"""
+        current = read_json(self.job / "model-before.json")
+        if current.get("replicas") != 1:
+            return False
+        for field in ("image_name", "env", "backend", "backend_version", "run_command",
+                      "distributed_inference_across_workers", "cpu_offloading", "gpu_selector", "gpu_type_selector"):
+            if current.get(field) != wanted.get(field):
+                return False
+        # 平台会补出 vendor=null；缺省空字段与显式空字段不改变 PD 行为。
+        if {k: v for k, v in (current.get("disaggregation") or {}).items() if v is not None} != {
+            k: v for k, v in (wanted.get("disaggregation") or {}).items() if v is not None}:
+            return False
+        if parse_options(current.get("backend_parameters")) != parse_options(wanted.get("backend_parameters")):
+            return False
+        previous = {r["name"]: r for r in current.get("roles") or []}
+        if set(previous) != {r["name"] for r in wanted["roles"]}:
+            return False
+        for role in wanted["roles"]:
+            old = previous[role["name"]]
+            if any(old.get(key) != role.get(key) for key in ("replicas", "image_name", "env", "gpu_selector")):
+                return False
+            if parse_options(old.get("backend_parameters")) != parse_options(role.get("backend_parameters")):
+                return False
+            a, b = old.get("extended_kv_cache") or {}, role.get("extended_kv_cache") or {}
+            if bool(a.get("enabled")) != bool(b.get("enabled")):
+                return False
+            if b.get("enabled") and any(a.get(key) != b.get(key) for key in ("mode", "cache_service_id", "chunk_size")):
+                return False
+        # 实例缺失或处于故障状态时直接重建，不能先走长达20分钟的无变化验证等待。
+        items = self.instances()
+        expected = Counter({r["name"]: r["replicas"] for r in wanted["roles"]})
+        if Counter(i["role"] for i in items) != expected or not all(i["state"] == "running" for i in items):
+            return False
+        service = self.owned_service()
+        return service is not None and service.get("healthy") is True if self.state["with_cache"] else service is None
+
+    def remember(self, running):
+        """持久化上次成功方案，与可清理的切换日志分开；停机后不依赖旧缓存编号。"""
+        value = {'format': 1, 'last_mode': self.state['target'], 'running': running, 'updated_at': stamp()}
+        if not running:
+            value['stopped_entry_sha256'] = hashlib.sha256((self.root / 'entrypoint/nginx.conf').read_bytes()).hexdigest()
+        write_json(self.root / 'model-state.json', value)
+
+    def finish_stop(self):
+        """整组和专用CPU池均退出后保留固定停机入口，同时确认其他服务没有重启。"""
+        if self.instances() or any(self.owned_model(c) or self.owned_cache(c) for c in self.host.containers()) or self.owned_service():
+            raise SwitchError('仍有本模型或专用缓存进程，不能报告停止成功。')
+        self.protected()
+        write_json(self.job / 'verified-model.json', payload(self.host.call('GET', self.model_route)))
+        self.publish_state()
+        atomic_file(self.root / 'entrypoint/nginx.conf', stopped_entry((self.job / 'nginx-running.conf').read_text()), 0o644)
+        self.host.reload_nginx()
+        for _ in range(30):
+            if self.host.request('/v1/chat/completions', {})[0] == 503:
+                break
+            self.host.sleep(0.5)
+        else:
+            raise SwitchError('停机入口未生效。')
+        self.remember(False)
+        self.save('committed', finished_at=stamp(), stopped=True)
+        self.event('模型与专用内存缓存已停止；上次方案已记住：' + self.state['target'])
+
+    def execute(self):
+        if self.state["phase"] != "queued":
+            raise SwitchError("执行器只能接管新建事务，已有事务须使用恢复入口。")
+        self.save("checking")
+        try:
+            current = self.host.call("GET", self.model_route)
+            before = read_json(self.job / "model-before.json")
+            if current.get("updated_at") != before.get("updated_at"):
+                raise SwitchError("排队期间模型被其他操作修改；本次未改变入口。")
+            service = self.owned_service()
+            same = self.target(service["id"] if service and self.state["with_cache"] else None)
+            if self.state.get('operation') != 'stop' and not self.state.get("restart") and self.same_configuration(same):
+                try:
+                    if self.state.get("extended_check"):
+                        # 同方案扩展验证也必须先隔离、排空，保证全局指标只包含本次探测。
+                        self.save("isolating")
+                        self.install_gate()
+                        self.save("draining")
+                        self.drain()
+                    self.save("verifying")
+                    self.verify(same)
+                    self.publish_state()
+                    if self.state.get("gate_intent"):
+                        self.restore_gate()
+                    self.remember(True)
+                    self.save("unchanged", finished_at=stamp())
+                    self.event("当前已是目标方案且验证正常，没有重启模型")
+                    return
+                except Exception as error:
+                    self.event("同方案验证未通过，将按完整流程重建", reason=str(error))
+            self.save("isolating")
+            self.install_gate()
+            self.save("draining")
+            self.drain()
+            self.save("stopping-model")
+            self.stop_model()
+            self.save("rebuilding-cache")
+            self.delete_cache()
+            if self.state.get('operation') == 'stop':
+                self.finish_stop()
+                return
+            cache_id = None
+            if self.state["with_cache"]:
+                cache_id = self.create_cache(read_json(self.job / "target-cache.json"))
+            model = self.target(cache_id)
+            write_json(self.job / "model-target.json", model)
+            self.save("starting-model")
+            self.host.call("PUT", self.model_route, model)
+            self.save("waiting-model")
+            self.ready(model)
+            self.save("verifying")
+            self.verify(model)
+            self.publish_state()
+            self.restore_gate()
+            self.remember(True)
+            self.save("committed", finished_at=stamp())
+            self.event("切换成功，已恢复外部访问：" + self.state["target"])
+        except BaseException as error:
+            self.event("目标切换未完成，将恢复原方案", reason=str(error))
+            self.save(error=str(error))
+            self.rollback()
+
+    def rollback(self):
+        """恢复原部署定义而非旧编号；缓存内容本身是易失数据，不能保证恢复。"""
+        if self.state["phase"] in TERMINAL:
+            return
+        try:
+            self.save("rolling-back")
+            self.event("开始回滚，外部生成继续保持隔离")
+            if self.state.get("model_mutation_intent"):
+                self.install_gate()
+                self.stop_model()
+                self.delete_cache()
+                original = payload(read_json(self.job / "model-before.json"))
+                cache_before = read_json(self.job / "cache-before.json")
+                if cache_before:
+                    new_id = self.create_cache(cache_definition(cache_before), rollback=True)
+                    old_id = cache_before["id"]
+                    for settings in [original.get("extended_kv_cache")] + [r.get("extended_kv_cache") for r in original.get("roles") or []]:
+                        if settings and settings.get("cache_service_id") == old_id:
+                            settings["cache_service_id"] = new_id
+                self.host.call("PUT", self.model_route, original)
+                if original.get("replicas"):
+                    self.ready(original, rollback=True)
+                    self.verify(original, rollback=True)
+                    self.publish_state()
+            if self.state.get("gate_intent"):
+                self.restore_gate()
+            previous_state = read_json(self.job / 'manager-before.json')
+            state_file = self.root / 'model-state.json'
+            if previous_state is not None:
+                write_json(state_file, previous_state)
+            elif state_file.exists():
+                state_file.unlink()
+            self.save("rolled-back", finished_at=stamp())
+            self.event("原方案已恢复并验证，外部访问已恢复；目标切换未成功" if self.state.get("model_mutation_intent")
+                else "切换已取消，模型未修改，入口恢复原状")
+        except BaseException as error:
+            # 原方案也无法验证时保持维护，不能为了返回成功而把故障模型暴露给业务。
+            self.save("rollback-failed", rollback_error=str(error), finished_at=stamp())
+            try:
+                self.install_gate()
+            except BaseException:
+                try:
+                    self.host.run(["docker", "stop", "--time", "10", self.config["proxy_container"]], timeout=30)
+                except BaseException:
+                    pass
+            self.event("回滚未完成，入口保持关闭；修复原因后运行 ./switch-pd.sh recover", reason=str(error))
+
+
+def endpoint(instance):
+    """实例地址来自平台，固定入口不得误当成动态后端端口。"""
+    port = int(instance["port"])
+    if not 1024 <= port <= 65535 or port in @@RESERVED_PORTS_PY@@:
+        raise SwitchError("平台实例端口不合法。")
+    return "http://" + instance["worker_ip"] + ":" + str(port)
+
+
+def preflight(host, target, operation="switch"):
+    """只读核对输入与资源归属；此函数不写入口，也不停止任何模型。"""
+    config = host.config
+    if shutil.disk_usage(host.root).free < 512 * 1024 ** 2:
+        raise SwitchError("部署目录可用磁盘不足512MiB，不能保证保存恢复快照。")
+    for name, expected in config.get("helper_sha256", {}).items():
+        if hashlib.sha256((host.root / name).read_bytes()).hexdigest() != expected:
+            raise SwitchError("依赖工具已变化，需要重新验证：" + name)
+    model = host.call("GET", "/v2/models/" + str(config["model_id"]))
+    if model.get("name") != config["model_name"] or model.get("local_path") != config["model_path"]:
+        raise SwitchError("当前模型身份与这套固定配置不符，不能套用旧模型参数。")
+    if model.get("scaling_schedule"):
+        raise SwitchError("模型设置了定时伸缩，需先在网页关闭，以免干扰维护。")
+    if (model.get("extended_kv_cache") or {}).get("enabled") or any(
+        (r.get("extended_kv_cache") or {}).get("enabled") for r in model.get("roles") or [] if r["name"] != "prefill"):
+        raise SwitchError("当前缓存并非仅关联 P，不能用此固定流程修改。")
+    profile_path = host.root / "switch-profiles" / (target + ".json")
+    if hashlib.sha256(profile_path.read_bytes()).hexdigest() != config["profile_sha256"][target]:
+        raise SwitchError("目标配置散列不符，请恢复正式脚本包，不能继续。")
+    profile = read_json(profile_path)
+    roles = {r["name"]: r for r in profile["roles"]}
+    shape = MODE_SHAPES[target]
+    if set(roles) != {"prefill", "decode", "router"} or roles["router"]["replicas"] != 1:
+        raise SwitchError("完整角色配置缺失。")
+    # 模板文件本身的JSON转义由json.load解除；后端参数值必须直接符合vLLM的JSON语法。
+    # 参数比较器可以兼容旧日志里的转义表示，但预检不能借这种兼容掩盖无法启动的真实参数。
+    for scope in (profile, roles["prefill"], roles["decode"]):
+        for argument in scope["backend_parameters"]:
+            key, equal, value = argument.partition('=')
+            if equal and value.lstrip().startswith(('{', '[')):
+                try:
+                    json.loads(value)
+                except json.JSONDecodeError as error:
+                    raise SwitchError("后端参数不是标准JSON，请移除额外转义：" + key) from error
+    for name in ("prefill", "decode"):
+        flags = parse_options(roles[name]["backend_parameters"])
+        replicas, tp = shape[name]
+        if roles[name]["replicas"] != replicas or int(flags["--tensor-parallel-size"]) != tp:
+            raise SwitchError("角色数或 TP 与方案不符。")
+        if flags.get("--speculative-config", {}).get("num_speculative_tokens") != 3 or flags.get("--default-chat-template-kwargs", {}).get("reasoning_effort") != "xhigh":
+            raise SwitchError("MTP3 或默认 xhigh 配置不完整。")
+    cache_path = host.root / "cache-service.json"
+    if hashlib.sha256(cache_path.read_bytes()).hexdigest() != config["cache_definition_sha256"]:
+        raise SwitchError("缓存定义散列不符，不能继续使用未经验证的内存容量或布局。")
+    cache_input = read_json(cache_path)
+    fields = cache_input["config"]["fields"]
+    if fields["ram_size"] != config["cache_gib"] or fields["chunk_size"] != config["chunk_size"]:
+        raise SwitchError("缓存容量或分块与已验证方案不一致。")
+    for reference, expected in (config["image_ids"].items() if operation != 'stop' else []):
+        actual = host.run(["docker", "image", "inspect", "--format", "{{.Id}}", reference], timeout=30).strip()
+        if actual != expected:
+            raise SwitchError("镜像标签指向的内容已变化：" + reference)
+    for name, expected in config.get("control_plane_images", {}).items():
+        actual = host.run(["docker", "inspect", "--format", "{{.Image}}", name], timeout=30).strip()
+        if actual != expected:
+            raise SwitchError("GPUStack平台镜像已升级，需要先验证切换脚本兼容性：" + name)
+    hardware = host.run(["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader"], timeout=30).splitlines()
+    observed = {}
+    for line in hardware:
+        index, separator, name = line.partition(',')
+        if separator and index.strip().isdigit():
+            observed[int(index.strip())] = name.strip()
+    allowed = set(config['mode_gpu_ids'][target])
+    if not allowed <= set(observed) or any('5090' not in observed[index] for index in allowed):
+        raise SwitchError('所选GPU缺失或不符合此SM120参考配方；不能猜测替代设备。')
+    selected = {int(g.rsplit(':', 1)[1]) for role in model.get('roles') or []
+                for g in (role.get('gpu_selector') or {}).get('gpu_ids') or []}
+    additional = sorted(allowed - selected) if selected else []
+    if operation != 'stop' and additional:
+        # 检查的是目标方案新增的实际卡号；不假设某台机器预留的是固定两个序号。
+        busy = host.run(['nvidia-smi', '-i', ','.join(map(str, additional)),
+                         '--query-compute-apps=pid,process_name', '--format=csv,noheader'], timeout=30).strip()
+        if busy:
+            raise SwitchError('目标方案新增GPU仍有其他计算进程；入口和当前模型尚未修改。')
+    check = copy.deepcopy(profile)
+    check["name"] = "gpustack-switch-validation-" + target
+    check["cluster_name"] = config["cluster_name"]
+    check["worker_selector"] = model.get("worker_selector")
+    result = host.call("POST", "/v2/models/import", {"content": json.dumps(check), "dry_run": True})
+    if not result.get("valid"):
+        raise SwitchError("GPUStack 官方配置校验失败。")
+    services = host.call("GET", "/v2/cache-services")["items"]
+    candidates = [c for c in services if c["name"] == config["cache_name"] and c.get("cluster_id") == model["cluster_id"]]
+    if len(candidates) > 1:
+        raise SwitchError("存在多个同名缓存，不能确定操作范围。")
+    cache = candidates[0] if candidates else None
+    references = [(r.get("extended_kv_cache") or {}).get("cache_service_id") for r in model.get("roles") or []
+                  if (r.get("extended_kv_cache") or {}).get("enabled")]
+    if references and (not cache or references != [cache["id"]]):
+        raise SwitchError("现有共享缓存与此模型的专用池不一致。")
+    if cache:
+        refs = host.call("GET", "/v2/cache-services/" + str(cache["id"]) + "/models")["items"]
+        if any(item["id"] != config["model_id"] for item in refs):
+            raise SwitchError("缓存还被其他模型使用，不能自动删除。")
+    proxy = host.inspect_proxy()
+    if not proxy["State"]["Running"]:
+        raise SwitchError("固定入口容器当前没有运行；请先恢复入口容器再切换。")
+    entry = (host.root / "entrypoint/nginx.conf").read_text()
+    if MARKER in entry:
+        raise SwitchError("入口仍有未恢复的维护条件，请先运行 ./switch-pd.sh recover。")
+    if STOP_MARKER in entry:
+        state_path = host.root / 'model-state.json'
+        saved = read_json(state_path) if state_path.exists() else {}
+        actual = hashlib.sha256((host.root / 'entrypoint/nginx.conf').read_bytes()).hexdigest()
+        if saved.get('running') is not False or saved.get('stopped_entry_sha256') != actual or model.get('replicas'):
+            raise SwitchError('停机状态与入口不一致，拒绝覆盖。')
+        normal_entry(entry)
+    host.run(["docker", "exec", config["proxy_container"], "nginx", "-t", "-c", "/config/nginx.conf"])
+    return {"model": model, "cache": cache, "profile": profile,
+            "dry_run": result.get("valid"), "memory": host.memory()}
+
+
+def prepare_job(host, args):
+    """在任何模型修改之前冻结原配置，事务目录与快照均为 root 私有。"""
+    initial = preflight(host, args.mode, getattr(args, 'operation', 'switch'))
+    parent = host.root / "baks/pd-switch"
+    name = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    job = parent / name
+    job.mkdir(mode=0o700)
+    state = {"id": name, "unit": "gpustack-pd-switch-" + name, "phase": "queued",
+        "target": args.mode, "operation": getattr(args, 'operation', 'switch'), "with_cache": args.mode != "1p1d-no-cache", "cluster_id": initial["model"]["cluster_id"],
+        "created_at": stamp(), "drain_timeout": args.drain_timeout, "restart": args.restart,
+        "extended_check": getattr(args, "extended_check", False),
+        "health_only": getattr(args, "health_only", False),
+        "gate_token": secrets.token_hex(24), "model_mutation_intent": False, "gate_intent": False,
+        "boot_id": host.boot_id()}
+    write_json(job / "state.json", state)
+    write_json(job / "model-before.json", initial["model"])
+    write_json(job / "cache-before.json", initial["cache"])
+    write_json(job / "memory-before.json", initial["memory"])
+    write_json(job / "target-profile.json", initial["profile"])
+    saved = host.root / 'model-state.json'
+    write_json(job / 'manager-before.json', read_json(saved) if saved.exists() else None)
+    definition = read_json(host.root / "cache-service.json")
+    definition["cluster_id"] = initial["model"]["cluster_id"]
+    definition["worker_selector"] = initial["model"]["worker_selector"]
+    # CPU服务器也屏蔽最后两卡；不能只约束vLLM角色而遗漏共享缓存的CUDA上下文。
+    if args.mode == '1p2d-6gpu-cache':
+        definition['config']['env']['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, host.config['mode_gpu_ids'][args.mode]))
+    write_json(job / "target-cache.json", definition)
+    original_entry = (host.root / "entrypoint/nginx.conf").read_text()
+    atomic_file(job / "nginx-before.conf", original_entry)
+    atomic_file(job / "nginx-running.conf", normal_entry(original_entry))
+    switch = Switch(host, job)
+    protected = {c["Name"].lstrip("/"): [c["Id"], c["State"]["StartedAt"], c["RestartCount"]]
+        for c in host.containers() if not switch.owned_model(c) and not switch.owned_cache(c)}
+    for name in (host.config['server_container'], host.config['worker_container'], host.config["proxy_container"]):
+        if name not in protected:
+            raise SwitchError("必需服务没有运行：" + name)
+    write_json(job / "protected-before.json", protected)
+    write_json(parent / "LAST.json", {"id": job.name})
+    return job
+
+
+def recover(root, identifier=None, retry=False):
+    """ExecStopPost 与开机恢复均复用此入口；内核锁确保不会与存活执行器同时回滚。"""
+    parent = Path(root) / "baks/pd-switch"
+    if identifier is None:
+        if not (parent / "LAST.json").exists():
+            return 0
+        identifier = read_json(parent / "LAST.json")["id"]
+    with transaction_lock(root, blocking=True):
+        job = checked_job(root, identifier)
+        state = read_json(job / "state.json")
+        if state["phase"] in TERMINAL:
+            return 0
+        if state["phase"] == "rollback-failed" and not retry:
+            # 已经完成一次恢复尝试后不立即反复重建；人工修复或下次启动可显式重试。
+            return 3
+        # 重启时 Docker 与 Server 的 HTTP 就绪可能滞后，入口维护条件先保持，不提前放行。
+        deadline = time.monotonic() + 300
+        while True:
+            try:
+                host = Host(root)
+                host.call("GET", "/v2/models/" + str(host.config["model_id"]))
+                break
+            except Exception:
+                if time.monotonic() >= deadline:
+                    raise SwitchError("管理服务仍未恢复，维护入口保持原状。")
+                time.sleep(5)
+        switch = Switch(host, job)
+        switch.rebase_after_reboot()
+        if not switch.state.get("error"):
+            switch.save(error="后台执行器意外结束，独立恢复进程接管")
+        switch.rollback()
+        return 0 if switch.state["phase"] == "rolled-back" else 3
+
+
+def status(root, show_log=True):
+    """只读显示持久化方案和最后事务，隐藏维护探测的临时通行值。"""
+    if (Path(root) / 'model-state.json').exists():
+        print(json.dumps(read_json(Path(root) / 'model-state.json'), ensure_ascii=False, indent=2))
+    pointer = Path(root) / "baks/pd-switch/LAST.json"
+    if not pointer.exists():
+        print("尚无切换记录。")
+        return 0
+    job = checked_job(root, read_json(pointer)["id"])
+    state = read_json(job / "state.json")
+    public = {k: v for k, v in state.items() if k not in ("gate_token",)}
+    public["backup_directory"] = str(job)
+    print(json.dumps(public, ensure_ascii=False, indent=2))
+    if show_log and (job / "events.jsonl").exists():
+        for line in (job / "events.jsonl").read_text().splitlines()[-8:]:
+            item = json.loads(line)
+            print("[" + item["at"] + "] " + item["message"] + ("；原因：" + str(item["reason"]) if item.get("reason") else ""))
+    return 0
+
+
+def follow(job):
+    """前台只读日志和状态，Ctrl+C 仅结束跟踪，不向后台切换任务发送信号。"""
+    position = 0
+    try:
+        while True:
+            log = Path(job) / "events.jsonl"
+            if log.exists():
+                with log.open(encoding="utf-8") as source:
+                    source.seek(position)
+                    for line in source:
+                        item = json.loads(line)
+                        print("[" + item["at"] + "] " + item["message"] + ("；原因：" + str(item["reason"]) if item.get("reason") else ""), flush=True)
+                    position = source.tell()
+            state = read_json(Path(job) / "state.json")
+            if state["phase"] in TERMINAL or state["phase"] == "rollback-failed":
+                print("记录目录：" + str(job), flush=True)
+                return {"committed": 0, "unchanged": 0, "rolled-back": 2, "aborted": 2}.get(state["phase"], 3)
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("后台任务继续执行。查看进度：./switch-pd.sh status", flush=True)
+        return 130
+
+
+def launch(root, args):
+    """后台执行器及独立退出恢复由 systemd 管理，不继承 SSH 会话的生存周期。"""
+    host = Host(root)
+    resolve_command(host, args)
+    if args.dry_run:
+        initial = preflight(host, args.mode, args.operation)
+        print(json.dumps({"dry_run": True, "target": args.mode, "valid": True,
+            "model_id": initial["model"]["id"], "current_cache_id": (initial["cache"] or {}).get("id"),
+            "available_gib": round(initial["memory"]["MemAvailable"] / 1024 ** 3, 2),
+            "will_modify_model_or_entry": False}, ensure_ascii=False, indent=2))
+        return 0
+    with transaction_lock(root):
+        pointer = root / "baks/pd-switch/LAST.json"
+        if pointer.exists():
+            old = checked_job(root, read_json(pointer)["id"])
+            if read_json(old / "state.json")["phase"] not in TERMINAL:
+                raise SwitchError("上一次切换尚未结束；先运行 ./switch-pd.sh status，必要时运行 recover。")
+        # 获取锁后再次解析实际方案，避免排队期间另一个维护操作改变启停状态。
+        resolve_command(host, args)
+        job = prepare_job(host, args)
+        state = read_json(job / "state.json")
+        script = str(root / "switch-pd.py")
+        try:
+            host.run(["systemd-run", "--quiet", "--collect", "--unit=" + state["unit"],
+                "--property=Type=exec", "--property=Restart=no", "--property=KillMode=control-group",
+                "--property=RuntimeMaxSec=2700", "--property=TimeoutStopSec=1800",
+                # ExecStopPost由systemd解析，不经过Shell；引号保留带空格路径，双百分号保留字面量。
+                "--property=ExecStopPost=/usr/bin/python3 " + json.dumps(script, ensure_ascii=False).replace('%', '%%') + " --recover-job " + job.name,
+                "/usr/bin/python3", script, "--worker-job", job.name], timeout=30)
+        except Exception:
+            state.update(phase="aborted", error="未能创建后台执行单元，尚未修改入口或模型。")
+            write_json(job / "state.json", state)
+            raise
+    print("后台任务：" + state["unit"] + "；关闭 SSH 不会中断。", flush=True)
+    return 0 if args.no_wait else follow(job)
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", nargs="?", choices=(*MODES, "start", "stop", "status", "recover"))
+    parser.add_argument("--dry-run", action="store_true", help="只读预检，不暂停入口或修改模型")
+    parser.add_argument("--no-wait", action="store_true", help="提交后台任务后立即返回")
+    parser.add_argument("--restart", action="store_true", help="即使已是目标方案也整组重建")
+    parser.add_argument("--extended-check", action="store_true", help="在入口隔离期间增加上下文、并发和缓存回归；升级验收时使用")
+    parser.add_argument("--health-only", action="store_true", help="仅检查全部成员、实际参数、入口及内存；不发送推理测试请求，不代表功能验收")
+    parser.add_argument("--drain-timeout", type=int, default=120, help="最多等待在途请求结束的秒数，默认120")
+    parser.add_argument("--worker-job", help=argparse.SUPPRESS)
+    parser.add_argument("--recover-job", help=argparse.SUPPRESS)
+    parser.add_argument("--recover-pending", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.health_only and args.extended_check:
+        parser.error("健康检查与扩展推理验证不能同时选择。")
+    if os.geteuid() != 0:
+        parser.error("请以 root 执行；需要本机 Docker 与 systemd 管理权限。")
+    if not 0 <= args.drain_timeout <= 600:
+        parser.error("排空等待须为0至600秒。")
+    configured_root = Path(read_json(ROOT / "switch-config.json")["production_root"]).resolve()
+    if ROOT != configured_root and not args.dry_run and args.mode != "status":
+        parser.error("当前位于资料副本，请在正式部署目录 " + str(configured_root) + " 执行，不能修改冻结版本。")
+    if args.worker_job:
+        # SIGTERM 转换为可恢复异常；SIGKILL 无法捕获，由独立 ExecStopPost 接管。
+        def interrupted(signum, frame):
+            raise SwitchError("后台任务收到终止信号 " + str(signum))
+        signal.signal(signal.SIGTERM, interrupted)
+        with transaction_lock(ROOT, blocking=True):
+            switch = Switch(Host(ROOT), checked_job(ROOT, args.worker_job))
+            switch.execute()
+            return 0 if switch.state["phase"] in ("committed", "unchanged") else (3 if switch.state["phase"] == "rollback-failed" else 2)
+    if args.recover_job or args.recover_pending or args.mode == "recover":
+        return recover(ROOT, args.recover_job, retry=args.mode == "recover" or args.recover_pending)
+    if args.mode == "status":
+        return status(ROOT)
+    if args.mode not in (*MODES, 'start', 'stop'):
+        parser.error("请选择四种部署方案之一，或start、stop、status、recover。")
+    return launch(ROOT, args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as failure:
+        print("执行未完成：" + str(failure), file=sys.stderr, flush=True)
+        raise SystemExit(3)

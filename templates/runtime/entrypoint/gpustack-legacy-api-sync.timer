@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh the fixed GPUStack model endpoint
+[Timer]
+OnBootSec=5s
+OnUnitInactiveSec=3s
+AccuracySec=1s
+Unit=gpustack-legacy-api-sync.service
+[Install]
+WantedBy=timers.target

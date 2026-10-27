@@ -1,0 +1,32 @@
+{
+  "name": "@@CACHE_NAME@@",
+  "provider_name": "LMCache",
+  "provider_version": "custom",
+  "cluster_id": 0,
+  "worker_selector": {
+    "node": "@@WORKER_LABEL@@"
+  },
+  "restart_on_error": true,
+  "config": {
+    "image": "@@CACHE_IMAGE@@",
+    "env": {
+      "CUDA_VISIBLE_DEVICES": "@@CACHE_GPU_IDS@@",
+      "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+      "LMCACHE_LOG_LEVEL": "INFO"
+    },
+    "fields": {
+      "ram_size": "@@CACHE_GIB@@",
+      "eviction_policy": "LRU",
+      "eviction_trigger_watermark": 0.85,
+      "eviction_ratio": 0.1,
+      "chunk_size": 1536,
+      "enable_p2p": false
+    },
+    "parameters": {
+      "server": [
+        "--separate-object-groups"
+      ]
+    },
+    "l2_storages": []
+  }
+}

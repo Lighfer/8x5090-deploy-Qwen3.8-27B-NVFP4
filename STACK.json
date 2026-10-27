@@ -1,0 +1,34 @@
+{
+  "base": "vllm/vllm-openai@sha256:6b90105076216e861cd30fae8828efef9263a0399137b894289f3b6a685bf4ff",
+  "source_commit": "e4a5b5537344b103ed10de7764378ef09604ef3d",
+  "vllm": "0.32.1rc1.dev466+ge4a5b5537",
+  "torch": "2.14.0+cu130",
+  "flashinfer": "0.7.2.post1",
+  "lmcache": "0.5.6",
+  "nixl": "1.5.0",
+  "transformers": "5.20.2",
+  "original_nixl_sha256": "07b53d62e69f3eac36217e19df9dc7420618e713b5f47bed9a07ff45e6f60262",
+  "patched_nixl_sha256": "78fa36d34328b3fbea29639679890e5ea56381bf10c75d8272e2a0b88f771a12",
+  "official_prs": [
+    62841,
+    60553,
+    59030,
+    62784,
+    62698,
+    54642,
+    62850
+  ],
+  "branch_repository_patches_applied": false,
+  "flashinfer6204": {
+    "upstream_pr": "https://github.com/flashinfer-ai/flashinfer/pull/6204",
+    "upstream_commit": "3821440929ee342fe9f939dbf5186c3e667a851c",
+    "flashinfer": "0.7.2.post1",
+    "page_original_sha256": "609dcde184160ed53f8115a3b380bdd1465c09a6bdcc9a4855082a0c49707b46",
+    "page_patched_sha256": "fc17d23801546d3f5d958897397266cba2fbff0efe68323f5bdd85531c89fd63",
+    "patch_sha256": "ac63410685aa5625206f56f1c832f16b2a070722dd186a323ee81fe55df34a01",
+    "kernel_sha256": "7752dbac9e655844e30890b4d49f5b7de13f68e154b826489cdb6a3744c88d26"
+  },
+  "gpustack": "2.3.0",
+  "gpustack_runtime": "0.2.6",
+  "router": "0.1.16"
+}

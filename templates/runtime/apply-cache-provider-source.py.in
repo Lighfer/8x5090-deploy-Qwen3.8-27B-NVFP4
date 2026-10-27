@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""通过 GPUStack 正式接口安装随部署文件保存的缓存目录源，不重启任何服务。"""
+import argparse
+from datetime import datetime
+import importlib.util
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent)
+parser.add_argument('--execute', action='store_true', help='保存旧目录配置并应用；未指定时只显示计划')
+args = parser.parse_args()
+root = args.root.resolve()
+source_file = root / 'cache-provider-source.yaml'
+assert source_file.is_file(), '缺少完整缓存目录源文件'
+print(json.dumps({'execute': args.execute, 'source': str(source_file),
+    'route': '/v2/ota-sources/cache-provider', 'services_restarted': False}, ensure_ascii=False))
+if not args.execute:
+    raise SystemExit(0)
+
+# 沿用目标部署的本机短期会话，认证值不进入参数、快照或输出。
+spec = importlib.util.spec_from_file_location('deployment_api', root / 'gpustack-local-api.py')
+api = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(api)
+previous = api.call('GET', '/v2/ota-sources/cache-provider')
+backup = root / 'baks/provider-source' / datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+backup.mkdir(parents=True, mode=0o700)
+(backup / 'before.json').write_text(json.dumps(previous, ensure_ascii=False, indent=2) + '\n')
+
+# 这是完整目录替换，保留文件中的全部提供方；升级 GPUStack 前应重新核对目录差异。
+# LMCache 的 vLLM 注入增加 eager_prefetch，地址、端口与 PD 连接器仍由平台生成。
+result = api.call('PUT', '/v2/ota-sources/cache-provider', {
+    'remote_enabled': True,
+    'custom': {'source_type': 'file', 'content': source_file.read_text(), 'auto_update_hours': 0},
+    'official': {'auto_update_hours': previous['official']['auto_update_hours']}})
+provider = api.call('GET', '/v2/cache-providers/LMCache')
+integration = next(i for i in provider['inference_backend_integrations'] if i['backend'] == 'vLLM')
+assert integration['injection']['kv_transfer_config']['kv_connector_extra_config'][
+    'lmcache.mp.eager_prefetch'] is True, '目录未生效'
+print(json.dumps({'applied': True, 'changed': result['changed'], 'backup': str(backup)}))

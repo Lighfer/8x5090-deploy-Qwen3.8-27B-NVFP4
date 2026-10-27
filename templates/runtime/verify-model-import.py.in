@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""使用官方只读导入校验验证全部正式方案，检查角色参数和副本状态。"""
+import argparse
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+
+
+
+def private_output(value):
+    """运行结果只写到私有目录；显式指定输出也不能写回源码仓库。"""
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path(@@ROOT_PY@@) / path
+    config = json.loads((Path(@@ROOT_PY@@) / 'switch-config.json').read_text())
+    repository = Path(config['source_repository']).resolve()
+    if path.is_symlink() or path.resolve().is_relative_to(repository):
+        raise ValueError('运行结果不能写入源码仓库')
+    return str(path)
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--root', default=@@ROOT_PY@@)
+    parser.add_argument('--output', default='模型配置校验.json')
+    args = parser.parse_args()
+    if getattr(args, 'output', None): args.output = private_output(args.output)
+    root = Path(args.root)
+    spec = importlib.util.spec_from_file_location('api', root / 'gpustack-local-api.py')
+    api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api)
+    configuration = json.loads((root / 'switch-config.json').read_text())
+    before = {item['id'] for item in api.call('GET', '/v2/models')['items']}
+    checks = []
+    for index, (mode, expected_sha) in enumerate(configuration['profile_sha256'].items()):
+        path = root / 'switch-profiles' / (mode + '.json')
+        checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        value = json.loads(path.read_text())
+        # 名称只存在于dry_run正文，不能覆盖正式部署；所有方案保持整组停止。
+        value.update(name='gpustack-validation-only-' + str(index), replicas=0)
+        response = api.call('POST', '/v2/models/import', {'content': json.dumps(value), 'dry_run': True})
+        entries = response.get('entries') or []
+        desired = entries[0].get('desired') if len(entries) == 1 else None
+        roles = {role['name']: role for role in (desired or {}).get('roles', [])}
+        complete = True
+        for name in ('prefill', 'decode'):
+            flags = roles.get(name, {}).get('backend_parameters') or []
+            complete = complete and any(item.startswith('--speculative-config=') and '"num_speculative_tokens":3' in item for item in flags)
+            complete = complete and any(item.startswith('--default-chat-template-kwargs=') and '"reasoning_effort":"xhigh"' in item for item in flags)
+        expected_router = next(r['image_name'] for r in value['roles'] if r['name'] == 'router')
+        row = {'mode': mode, 'profile_sha256_matches': checksum == expected_sha,
+               'valid': response.get('dry_run') is True and response.get('valid') is True,
+               'stopped': desired is not None and desired.get('replicas') == 0,
+               'complete_mtp_xhigh_on_both_roles': bool(complete),
+               'router_matches_profile': roles.get('router', {}).get('image_name') == expected_router}
+        row['passed'] = all(row[key] for key in ('profile_sha256_matches', 'valid', 'stopped',
+            'complete_mtp_xhigh_on_both_roles', 'router_matches_profile'))
+        checks.append(row)
+    after = {item['id'] for item in api.call('GET', '/v2/models')['items']}
+    report = {'method': 'GPUStack2.3 POST /v2/models/import dry_run=true', 'checks': checks,
+              'model_identifiers_unchanged': before == after,
+              'passed': all(row['passed'] for row in checks) and before == after}
+    Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    print(json.dumps(report, ensure_ascii=False))
+    return 0 if report['passed'] else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

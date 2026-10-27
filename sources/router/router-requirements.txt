@@ -1,0 +1,2 @@
+vllm-router==0.1.16 --hash=sha256:f400a6d7ba80ab613f28b915a7b81ba8cddcb85732470e3c9737d3430ed6d251
+orjson==3.13.0 --hash=sha256:bceadfd314bd238f584fc229a4bbaf0e573597e7a026dec5429fbf29fd66c641

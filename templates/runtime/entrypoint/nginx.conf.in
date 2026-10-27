@@ -1,0 +1,68 @@
+# 固定对外入口仅转发模型 API，管理页面与 Router 成员管理接口不在允许范围内。
+worker_processes 2;
+pid /tmp/nginx.pid;
+error_log /dev/stderr warn;
+events { worker_connections 4096; }
+http {
+
+    include /etc/nginx/mime.types;
+    default_type application/json;
+    log_format legacy '$remote_addr [$time_local] "$request_method $uri" $status $body_bytes_sent $request_time';
+    access_log /dev/stdout legacy;
+    client_body_temp_path /tmp/client_body;
+    proxy_temp_path /tmp/proxy;
+    fastcgi_temp_path /tmp/fastcgi;
+    uwsgi_temp_path /tmp/uwsgi;
+    scgi_temp_path /tmp/scgi;
+    client_max_body_size 0;
+    sendfile on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    include /config/upstream.conf;
+    server {
+        listen @@ENTRY_PORT@@;
+        listen [::]:@@ENTRY_PORT@@;
+        # 请求和响应均不缓冲，保留图片请求、SSE 以及客户端中断的传播。
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        # Router 多路由模式的 Responses 透明路径默认偏好普通路由；本入口明确承载 PD 模型。
+        # 覆盖客户端同名 Header，以使用原生 P/D 流程，保留 Responses 正文与响应协议。
+        proxy_set_header X-Prefer-PD true;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        proxy_connect_timeout 5s;
+        # 禁止自动重试，避免生成请求在故障时被重复执行。
+        proxy_next_upstream off;
+        error_page 502 503 504 = @not_ready;
+        location /v1/ {
+            proxy_pass http://legacy_model;
+        }
+        # 保持原 vLLM 的 OpenAI 模型列表格式，生成请求仍经过 PD Router。
+        location = /v1/models { proxy_pass http://legacy_metadata; }
+        location ~ ^/v1/models/[^/]+$ { proxy_pass http://legacy_metadata; }
+        # 原服务未启用 Responses 记录保留；生成仍走 PD，记录查询沿用后端原生的未找到响应。
+        # 不为兼容 Router 的查询路径而额外开启会无限保留记录的内存存储。
+        location ~ ^/v1/responses/ { proxy_pass http://legacy_metadata; }
+        location = /health { proxy_pass http://legacy_model/health; }
+        location = /ping { proxy_pass http://legacy_model/health; }
+        location ~ ^/(version|tokenize|detokenize|get_tokenizer_info|get_model_config)$ {
+            proxy_pass http://legacy_metadata;
+        }
+        location = /metrics {
+            # 独立只读采集服务汇集 GPUStack 角色指标、原 Decode 兼容指标和共享缓存指标。
+            default_type "text/plain; version=0.0.4";
+            alias /config/metrics.prom;
+        }
+        location @not_ready {
+            add_header Retry-After 10 always;
+            return 503 '{"error":{"message":"Model service is starting. Please retry.","type":"service_unavailable"}}';
+        }
+        location / { return 404; }
+    }
+}

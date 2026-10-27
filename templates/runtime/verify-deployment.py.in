@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""只读检查本机 GPUStack、LXC 内存、原生 P/D 副本及固定入口；不创建模型请求。"""
+import argparse
+import collections
+import datetime
+import importlib.util
+import json
+from pathlib import Path
+import re
+import subprocess
+import urllib.request
+
+
+def fetch(url):
+    with urllib.request.urlopen(url, timeout=15) as response:
+        return response.status, response.read().decode()
+
+
+
+def private_output(value):
+    """运行结果只写到私有目录；显式指定输出也不能写回源码仓库。"""
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path(@@ROOT_PY@@) / path
+    config = json.loads((Path(@@ROOT_PY@@) / 'switch-config.json').read_text())
+    repository = Path(config['source_repository']).resolve()
+    if path.is_symlink() or path.resolve().is_relative_to(repository):
+        raise ValueError('运行结果不能写入源码仓库')
+    return str(path)
+
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--root', default=@@ROOT_PY@@)
+    parser.add_argument('--host', default=@@HOST_PY@@)
+    parser.add_argument('--model-id', type=int, default=@@MODEL_ID@@)
+    parser.add_argument('--worker-name', default=@@NODE_PY@@)
+    parser.add_argument('--expect-isolated', action='store_true')
+    parser.add_argument('--output', default='部署验证.json')
+    args = parser.parse_args()
+    if getattr(args, 'output', None): args.output = private_output(args.output)
+    root = Path(args.root)
+    spec = importlib.util.spec_from_file_location('local_api', root / 'gpustack-local-api.py')
+    api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api)
+    checks = []
+    facts = {}
+
+    def check(name, passed, detail=None):
+        checks.append({'name': name, 'passed': bool(passed), 'detail': detail})
+
+    # Compose 的展开内容可能含注册令牌，只在内存检查，绝不写入结果或错误输出。
+    result = subprocess.run(['docker', 'compose', '--project-directory', str(root), 'config', '--format', 'json'],
+        capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError('Compose configuration could not be parsed')
+    configuration = json.loads(result.stdout)
+    check('Compose必要服务', {'server', 'worker'} <= set(configuration['services']))
+    worker_config = configuration['services']['worker']
+    check('Worker注册令牌非空', bool(worker_config.get('environment', {}).get('GPUSTACK_TOKEN')))
+    runtime_info = json.loads(subprocess.check_output(['docker', 'info', '--format', '{{json .Runtimes}}'], text=True))
+    check('NVIDIA运行时', 'nvidia' in runtime_info)
+    containers = json.loads(subprocess.check_output(['docker', 'inspect', @@SERVER_PY@@, @@WORKER_PY@@, @@PROXY_PY@@], text=True))
+    facts['containers'] = [{'name': row['Name'].lstrip('/'), 'id': row['Id'], 'image_id': row['Image'],
+        'running': row['State']['Running'], 'started_at': row['State']['StartedAt'],
+        'health': row['State'].get('Health', {}).get('Status')} for row in containers]
+    check('管理与入口容器运行', all(row['running'] for row in facts['containers']))
+    check('Server健康', facts['containers'][0]['health'] == 'healthy')
+    workers = api.call('GET', '/v2/workers')['items']
+    worker = next(row for row in workers if row['name'] == args.worker_name)
+    memory = worker.get('status', {}).get('memory') or {}
+    gpus = worker.get('status', {}).get('gpu_devices') or []
+    local_total = int(re.search(r'^MemTotal:\s+(\d+)\s+kB$', Path('/proc/meminfo').read_text(), re.M)[1]) * 1024
+    facts['worker'] = {'id': worker['id'], 'name': worker['name'], 'state': worker['state'],
+        'memory': memory, 'gpu_count': len(gpus), 'lxc_memory_total_bytes': local_total}
+    check('WorkerReady且八卡', worker['state'] == 'ready' and len(gpus) == 8)
+    check('Worker按LXC实际上报', memory.get('total') == local_total)
+    model = api.call('GET', f'/v2/models/{args.model_id}')
+    instances = api.call('GET', f'/v2/models/{args.model_id}/instances')['items']
+    active = [row for row in instances if row.get('deleted_at') is None]
+    expected = {row['name']: row['replicas'] if row.get('replicas') is not None else model['replicas']
+        for row in model['roles'] if row['name'] in ('prefill', 'decode', 'router')}
+    actual = collections.Counter(row['role'] for row in active)
+    check('角色副本数与配置一致', dict(actual) == expected, {'expected': expected, 'actual': dict(actual)})
+    check('全部原生实例运行', all(row['state'] == 'running' for row in active))
+    facts['instances'] = [{key: row.get(key) for key in ('id', 'role', 'port', 'worker_ip', 'gpu_indexes', 'state')} for row in active]
+    for row in active:
+        status, _ = fetch(f"http://{row['worker_ip']}:{row['port']}/health")
+        check('实例健康/' + str(row['id']), status == 200)
+    # 缓存按当前角色的真实引用发现；关闭缓存时不误查已经删除的旧编号。
+    cache_ids = {row['extended_kv_cache']['cache_service_id'] for row in model['roles']
+        if (row.get('extended_kv_cache') or {}).get('enabled') and row['extended_kv_cache'].get('mode') == 'shared'}
+    facts['caches'] = []
+    for cache_id in sorted(cache_ids):
+        cache = api.call('GET', '/v2/cache-services/' + str(cache_id))
+        facts['caches'].append({'id': cache['id'], 'name': cache['name'], 'state': cache['state'],
+            'healthy': cache['healthy'], 'ram_gib': cache['config']['fields']['ram_size']})
+        check('共享缓存健康/' + str(cache_id), cache['state'] == 'running' and cache['healthy'])
+    status, models = fetch(f'http://{args.host}:@@ENTRY_PORT@@/v1/models')
+    names = [row['id'] for row in json.loads(models).get('data', [])]
+    check('固定入口模型列表', status == 200 and @@MODEL_NAME_PY@@ in names)
+    _, metrics = fetch(f'http://{args.host}:@@ENTRY_PORT@@/metrics')
+    check('指标汇集来源健康', re.search(r'^gpustack_bridge:source_up\s+1(?:\.0)?$', metrics, re.M) is not None)
+    check('动态KV容量可见', 'gpustack_bridge:kv_cache_capacity_tokens{' in metrics)
+    entry_configuration = (root / 'entrypoint/nginx.conf').read_text()
+    gated = '# BEGIN COMPARISON GATE' in entry_configuration or '# gpustack-pd-switch:' in entry_configuration
+    check('外部请求隔离状态符合预期', gated == args.expect_isolated, {'isolated': gated})
+    for unit in ('gpustack-metrics-bridge.service', 'gpustack-legacy-api-sync.timer'):
+        check('入口服务/' + unit, subprocess.run(['systemctl', 'is-active', '--quiet', unit]).returncode == 0)
+    report = {'at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'passed': all(row['passed'] for row in checks),
+        'checks': checks, 'facts': facts, 'scope': '只读环境与健康检查；答案、图片、工具及性能结果另见对应核验'}
+    Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2))
+    print(json.dumps({'passed': report['passed'], 'checks': len(checks),
+        'failed': [row['name'] for row in checks if not row['passed']]}))
+    if not report['passed']:
+        raise RuntimeError('Deployment verification failed')
+
+
+if __name__ == '__main__':
+    main()

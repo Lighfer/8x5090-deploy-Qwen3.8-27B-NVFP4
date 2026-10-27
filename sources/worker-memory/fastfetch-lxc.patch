@@ -1,0 +1,62 @@
+--- fastfetch.original.py
++++ fastfetch.patched.py
+@@ -1,4 +1,6 @@
+ import json
++import os
++from pathlib import Path
+ import logging
+ import platform
+ import subprocess
+@@ -18,6 +20,42 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++
++def _read_lxc_memory(cgroup_root: str, total: int) -> tuple[int, int]:
++    """读取 LXC 整体内存统计；仅在显式配置 LXC 模式时调用。
++
++    /proc/meminfo 必须是 LXCFS 的只读挂载，用于取得实际内存容量。
++    根控制组统计必须来自 LXC 主机的只读目录，不能使用 Worker 自身的
++    控制组，否则会把节点内存用量误报成 Worker 进程本身的用量。
++    """
++    mount_lines = Path("/proc/self/mountinfo").read_text().splitlines()
++    has_lxcfs = any(
++        line.split()[4] == "/proc/meminfo"
++        and line.split(" - ", 1)[1].split()[0] == "fuse.lxcfs"
++        for line in mount_lines
++        if " - " in line
++    )
++    if not has_lxcfs or total <= 0:
++        raise RuntimeError("LXC memory mode requires the LXCFS /proc/meminfo mount")
++
++    root = Path(cgroup_root)
++    current = int((root / "memory.current").read_text().strip())
++    counters = dict(
++        (key, int(value))
++        for key, value in (
++            line.split() for line in (root / "memory.stat").read_text().splitlines()
++        )
++    )
++    # 与本机 LXCFS 的内存视图保持一致：剔除可回收文件缓存和可回收 slab，
++    # 将不可按普通文件缓存回收的共享内存加回，单位均为字节。
++    # 不使用固定容量常数，LXC 容量变化后会在下一次采集时反映。
++    used = max(
++        0,
++        current - counters["file"] + counters["shmem"] - counters["slab_reclaimable"],
++    )
++    return total, used
++
++
+ class Fastfetch(SystemInfoDetector):
+     def is_available(self) -> bool:
+         try:
+@@ -89,6 +127,9 @@
+             elif typ == "Memory":
+                 total = self._get_value(r, "total") or 0
+                 used = self._get_value(r, "used") or 0
++                # 只修正显式配置了 LXC 根控制组路径的 Worker；其他系统沿用官方采集逻辑。
++                if cgroup_root := os.environ.get("GPUSTACK_LXC_CGROUP_ROOT"):
++                    total, used = _read_lxc_memory(cgroup_root, total)
+                 utilization_rate = used / total * 100 if total > 0 else 0
+ 
+                 system_info.memory = MemoryInfo(

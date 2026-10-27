@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""只读发现指定模型的就绪实例，更新固定端口代理的上游。"""
+from pathlib import Path
+import json
+import os
+import re
+import subprocess
+import urllib.request
+import urllib.error
+import urllib.parse
+
+ROOT = Path(@@ENTRY_ROOT_PY@@)
+PROXY = @@PROXY_PY@@
+MODEL_ID = @@MODEL_ID@@
+
+# 只读查询沿用服务器已有数据库连接，不创建或导出任何管理/推理凭据。
+QUERY = """import os,subprocess,json,sys
+from pathlib import Path
+env=dict(os.environ,PGPASSWORD=Path('/var/lib/gpustack/postgres_root_pass').read_text().strip())
+sql=f\"SELECT coalesce(json_agg(row_to_json(t)),'[]') FROM (SELECT id,role,worker_ip AS ip,port FROM model_instances WHERE model_id={int(sys.argv[1])} AND role IN ('router','prefill','decode') AND lower(state::text)='running' AND deleted_at IS NULL ORDER BY id DESC) t\"
+p=subprocess.run(['psql','-X','-h','127.0.0.1','-U','root','-d','gpustack','-At','-c',sql],env=env,capture_output=True,text=True,check=True)
+print(p.stdout.strip() or 'null')
+"""
+
+def run(args):
+    """命令以参数数组调用；异常输出不包含环境变量或凭据。"""
+    return subprocess.run(args, capture_output=True, text=True, check=True, timeout=15)
+
+def atomic_write(path, content):
+    """同目录原子替换；目录挂载使 Nginx 能看到新文件。"""
+    temporary = path.with_suffix(path.suffix + '.new')
+    temporary.write_text(content)
+    temporary.chmod(0o644)
+    os.replace(temporary, path)
+
+
+def main():
+    result = run(['docker','exec',@@SERVER_PY@@,'python','-c',QUERY,str(MODEL_ID)])
+    instances = json.loads(result.stdout)
+    # 指标由独立的每秒采集服务发布，避免与上游发现任务交错覆盖。
+    targets = {'router': '127.0.0.1:9', 'decode': '127.0.0.1:9'}
+    selected = {}
+    ready_roles = {instance['role'] for instance in instances}
+    # 仅接受已授权的本机地址和动态推理端口，禁止误指向固定入口造成转发循环。
+    # Router 选最新就绪实例；固定 Decode 选最早就绪实例，新增副本时尽量保留 Responses 上下文。
+    ordered = sorted(instances, key=lambda x: -int(x['id']) if x['role'] == 'router' else int(x['id']))
+    for instance in ordered:
+        role = instance['role']
+        if role not in targets or role in selected:
+            continue
+        if role == 'router' and not {'prefill', 'decode'}.issubset(ready_roles):
+            # Router 的进程健康不表示两侧仍有可用引擎；缺少角色时明确返回未就绪。
+            continue
+        port = int(instance['port'])
+        if instance['ip'] != @@HOST_PY@@ or not 1024 <= port <= 65535 or port in @@RESERVED_PORTS_PY@@:
+            raise RuntimeError('Model address is outside the permitted endpoint')
+        try:
+            with urllib.request.urlopen(f"http://{instance['ip']}:{port}/health", timeout=3) as response:
+                if response.status != 200:
+                    continue
+        except (OSError, urllib.error.URLError):
+            # 切换时数据库状态与进程退出可能短暂交错；未通过探测的地址不能继续使用。
+            continue
+        targets[role] = f"{instance['ip']}:{port}"
+        selected[role] = instance['id']
+    content = (
+        f'upstream legacy_model {{ server {targets["router"]}; keepalive 64; }}\n'
+        # Router 的模型列表格式与原 vLLM 不同；只读元数据接口直接查询同一模型的 Decode。
+        f'upstream legacy_metadata {{ server {targets["decode"]}; keepalive 8; }}\n'
+    )
+    path = ROOT/'upstream.conf'
+    previous = path.read_text() if path.exists() else ''
+    if previous == content:
+        return
+    atomic_write(path, content)
+    try:
+        state = json.loads(run(['docker','inspect',PROXY]).stdout)[0]['State']
+        if state['Running']:
+            run(['docker','exec',PROXY,'nginx','-t','-c','/config/nginx.conf'])
+            run(['docker','exec',PROXY,'nginx','-s','reload','-c','/config/nginx.conf'])
+    except Exception:
+        atomic_write(path, previous)
+        raise
+    print(json.dumps({'model_id':MODEL_ID,'instances':selected,'targets':targets}))
+
+if __name__ == '__main__':
+    main()

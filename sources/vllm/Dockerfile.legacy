@@ -1,0 +1,19 @@
+# 使用已经下载并核对的官方基础镜像。构建过程无需拉取安装包，也不重新编译 CUDA。
+ARG BASE_IMAGE=vllm/vllm-openai@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34
+FROM ${BASE_IMAGE}
+
+# GPUStack 自行生成启动命令，需要清除官方镜像自带的 vllm serve 入口。
+ENTRYPOINT []
+CMD []
+
+# 部分维护工具使用 python 名称；别名指向镜像同一个 Python3，不安装第二套解释器。
+RUN test -x /usr/bin/python3 && if ! command -v python >/dev/null 2>&1; then ln -s /usr/bin/python3 /usr/local/bin/python; fi
+COPY patches/ /opt/gpustack-v032/patches/
+
+# 仅移植新上游仍然需要的异常握手保护，先核对源码再执行独立回环端口验证。
+RUN python3 /opt/gpustack-v032/patches/patch-nixl-handshake.py && \
+    python3 /opt/gpustack-v032/patches/verify-nixl-handshake.py
+
+LABEL local.gpustack.purpose="Qwen3.8-27B SM120 native NVFP4 KV + MTP + NIXL/LMCache" \
+      local.gpustack.vllm-version="0.32.0" \
+      local.gpustack.patch-scope="nixl-malformed-handshake-guard"

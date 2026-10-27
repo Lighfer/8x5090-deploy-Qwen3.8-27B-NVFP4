@@ -1,0 +1,9 @@
+{
+  "upstream_pr": "https://github.com/flashinfer-ai/flashinfer/pull/6204",
+  "upstream_commit": "3821440929ee342fe9f939dbf5186c3e667a851c",
+  "flashinfer": "0.7.2.post1",
+  "page_original_sha256": "609dcde184160ed53f8115a3b380bdd1465c09a6bdcc9a4855082a0c49707b46",
+  "page_patched_sha256": "fc17d23801546d3f5d958897397266cba2fbff0efe68323f5bdd85531c89fd63",
+  "patch_sha256": "ac63410685aa5625206f56f1c832f16b2a070722dd186a323ee81fe55df34a01",
+  "kernel_sha256": "7752dbac9e655844e30890b4d49f5b7de13f68e154b826489cdb6a3744c88d26"
+}

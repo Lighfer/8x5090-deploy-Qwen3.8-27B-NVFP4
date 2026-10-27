@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""在切换事务的维护期间，比较真实上下文、并发、GPU、MTP 和缓存指标。"""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import datetime
+import importlib.util
+import json
+import math
+from pathlib import Path
+import statistics
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def request(url, data=None, headers=None, timeout=30):
+    """以参数数组和显式请求头访问；维护通行值仅保留在进程内。"""
+    req = urllib.request.Request(url, data=json.dumps(data).encode() if data is not None else None,
+        headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return response.status, response.read().decode()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode()
+
+
+def distribution(values):
+    """采用线性插值报告样本分位数；保留样本数，不能把小样本尾部当作稳定生产尾延迟。"""
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    def percentile(q):
+        position = (len(ordered) - 1) * q
+        left = math.floor(position)
+        right = math.ceil(position)
+        return ordered[left] + (ordered[right] - ordered[left]) * (position - left)
+    return {"count": len(values), "mean": statistics.fmean(values), "median": statistics.median(values),
+        "p95": percentile(.95), "p99": percentile(.99), "min": ordered[0], "max": ordered[-1]}
+
+
+def metrics(base):
+    """保留原始带标签指标文本，汇总时仅对相同名称累加，不将累计值当成本轮吞吐。"""
+    status, text = request(base + "/metrics")
+    if status != 200:
+        raise RuntimeError("引擎指标不可读")
+    values = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        key, value = line.rsplit(" ", 1)
+        try:
+            value = float(value)
+        except ValueError:
+            continue
+        name = key.split("{", 1)[0]
+        values[name] = values.get(name, 0) + value
+    return text, values
+
+
+def make_prompt(tokens, nonce):
+    """生成完全合成的检索上下文；首部独立随机值避免冷请求意外共享前缀。"""
+    # 此英语短语在本模型词表中约为四个词元；最终以响应 usage 中的实际计数为准。
+    filler = " ordinary record data."
+    section = filler * max(1, tokens // 12)
+    return ("核对编号：" + nonce + "。阅读记录，回答最后的问题。\n" + section +
+        "\n唯一核验标记：ALPHA-7319。\n" + section + "\n" + section +
+        "\n请只给出唯一核验标记，不要复述记录。")
+
+
+def generate(base, headers, tokens, nonce, concurrent, long_output=False, prompt_override=None):
+    """用流式响应计时；首个思考或正文片段算首字，生成速度按 usage 的真实词元计算。"""
+    prompt = prompt_override if prompt_override is not None else make_prompt(tokens, nonce)
+    if long_output:
+        # 单独的持续生成阶段用于观察P/D重叠；不混入前面20个检索请求的对照统计。
+        prompt += '\n先给出唯一核验标记，再从1到300逐行列出n+1=结果的完整算式。每行纯文本，不能省略，不能用代码代替。'
+    payload = {"model": @@MODEL_NAME_PY@@, "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 3072 if long_output else 512, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}
+    started = time.monotonic()
+    first = None
+    content = []
+    reasoning = []
+    usage = None
+    done = False
+    finish_reason = None
+    req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", **headers})
+    with urllib.request.urlopen(req, timeout=300) as response:
+        if response.status != 200:
+            raise RuntimeError("生成状态异常")
+        for raw in response:
+            line = raw.decode().strip()
+            if not line.startswith("data: "):
+                continue
+            if line[6:] == "[DONE]":
+                done = True
+                break
+            item = json.loads(line[6:])
+            usage = item.get("usage") or usage
+            for choice in item.get("choices", []):
+                delta = choice.get("delta") or {}
+                thought = delta.get("reasoning") or delta.get("reasoning_content") or ""
+                answer = delta.get("content") or ""
+                if first is None and (thought or answer):
+                    first = time.monotonic()
+                reasoning.append(thought)
+                content.append(answer)
+                finish_reason = choice.get("finish_reason") or finish_reason
+    ended = time.monotonic()
+    answer = "".join(content)
+    correct = "ALPHA-7319" in answer
+    # 持续负载允许用完明确给定的输出预算。xhigh可能把该预算用于思考，达到length不是引擎故障。
+    # 正确性检索仍要求完整最终答案；达到预算的持续负载只用于速度和GPU协同观察，不能算正确答案样本。
+    budget_limited = long_output and finish_reason == 'length'
+    valid_answer = correct or (budget_limited and bool(''.join(reasoning)))
+    valid_finish = finish_reason == 'stop' or budget_limited
+    if not done or not usage or first is None or not valid_answer or not valid_finish:
+        raise RuntimeError("默认xhigh检索或流式完成失败：" + json.dumps({"done": done, "usage": usage,
+            "answer": answer[:160], "finish_reason": finish_reason}, ensure_ascii=False))
+    output_tokens = usage["completion_tokens"]
+    if long_output and output_tokens < 512:
+        raise RuntimeError('持续生成阶段输出过短，不能据此宣称已验证P/D重叠')
+    return {"target_prompt_tokens": tokens, "concurrency": concurrent, "usage": usage,
+        "default_thinking": bool("".join(reasoning)), "correct": correct if not budget_limited else None, "answer": answer,
+        "first_token_seconds": first - started, "total_seconds": ended - started,
+        "decode_tokens_per_second": max(output_tokens - 1, 0) / max(ended - first, .000001),
+        "finish_reason": finish_reason, 'output_truncated_by_budget': budget_limited}
+
+
+def external_hits(url):
+    """只读取P的外部前缀命中，D的同名计数还包括NIXL，不能作为CPU证据。"""
+    text, values = metrics(url)
+    return values.get('vllm:external_prefix_cache_hits_total', 0), text
+
+
+def cpu_cache_proof(api, config, state, base, headers, instances, job, stop, thread):
+    """通过另一P或GPU缓存冷启动验证CPU读回，保持生产开发接口关闭。"""
+    prefills = [item for item in instances if item['role'] == 'prefill']
+    nonce = uuid.uuid4().hex
+    cache_before = api.call('GET', '/v2/cache-services/' + str(state['cache_id']))
+    if len(prefills) >= 2:
+        first, second = prefills[:2]
+        first_url = 'http://' + first['worker_ip'] + ':' + str(first['port'])
+        second_url = 'http://' + second['worker_ip'] + ':' + str(second['port'])
+        before, raw = external_hits(second_url)
+        (job / 'cpu-proof-before.txt').write_text(raw)
+        # 直接调用P的普通生成，不指定远端解码参数；另一P从未计算这一随机输入。
+        generate(first_url, {}, 16384, nonce, 1)
+        time.sleep(3)
+        repeated = generate(second_url, {}, 16384, nonce, 1)
+        after, raw = external_hits(second_url)
+        (job / 'cpu-proof-after.txt').write_text(raw)
+        return {'enabled': True, 'method': 'cross_prefill_same_cpu_pool',
+            'source_prefill': first['name'], 'retrieving_prefill': second['name'],
+            'external_hit_counter_delta': after - before, 'repeated_request': repeated}
+
+    prefill_url = 'http://' + prefills[0]['worker_ip'] + ':' + str(prefills[0]['port'])
+    # 先用较短分支寻找自然CPU复用：Mamba的GPU状态只保留语义检查点，内存中可有更早的快照。
+    header = '记录编号：' + nonce + '。唯一核验标记：ALPHA-7319。\n'
+    filler = ' ordinary record data.'
+    question = '\n请只回答唯一核验标记。'
+    warm_prompt = header + filler * 32768 + question
+    branch_prompt = header + filler * 8448 + question
+    generate(base, headers, 131072, nonce, 1, prompt_override=warm_prompt)
+    time.sleep(3)
+    before, raw = external_hits(prefill_url)
+    (job / 'cpu-proof-before.txt').write_text(raw)
+    repeated = generate(base, headers, 33792, nonce, 1, prompt_override=branch_prompt)
+    after, raw = external_hits(prefill_url)
+    if after > before:
+        (job / 'cpu-proof-after.txt').write_text(raw)
+        return {'enabled': True, 'method': 'earlier_shared_prefix_checkpoint',
+            'external_hit_counter_delta': after - before, 'repeated_request': repeated}
+
+    # 生产模式没有缓存重置API；保留同一个CPU池，通过平台原生整组重启使GPU缓存冷启动。
+    # 这是一次升级验收操作，普通一键切换不执行此分支。
+    stop.set()
+    thread.join(timeout=20)
+    api.call('POST', '/v2/models/' + str(config['model_id']) + '/restart')
+    deadline = time.monotonic() + 600
+    expected = {'prefill': 1, 'decode': 1, 'router': 1}
+    while time.monotonic() < deadline:
+        fresh = api.call('GET', '/v2/models/' + str(config['model_id']) + '/instances')['items']
+        if any(item['state'] == 'error' for item in fresh):
+            raise RuntimeError('保留CPU池的GPU冷启动出现实例错误')
+        counts = {role: sum(item['role'] == role for item in fresh) for role in expected}
+        if counts == expected and all(item['state'] == 'running' for item in fresh):
+            urls = ['http://' + item['worker_ip'] + ':' + str(item['port']) for item in fresh]
+            if all(request(url + '/health')[0] == 200 for url in urls):
+                break
+        time.sleep(5)
+    else:
+        raise RuntimeError('保留CPU池的GPU冷启动超时')
+    subprocess.run(['python3', str(ROOT / 'entrypoint/sync-upstream.py')], check=True, timeout=45,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    time.sleep(2)
+    target = next(item for item in fresh if item['role'] == 'prefill')
+    prefill_url = 'http://' + target['worker_ip'] + ':' + str(target['port'])
+    before, raw = external_hits(prefill_url)
+    (job / 'cpu-cold-restart-before.txt').write_text(raw)
+    repeated = generate(base, headers, 131072, nonce, 1, prompt_override=warm_prompt)
+    after, raw = external_hits(prefill_url)
+    (job / 'cpu-proof-after.txt').write_text(raw)
+    cache_after = api.call('GET', '/v2/cache-services/' + str(state['cache_id']))
+    assert cache_before['id'] == cache_after['id'] and cache_after['healthy'] is True
+    return {'enabled': True, 'method': 'native_model_restart_cpu_pool_preserved',
+        'same_cache_service_id': cache_after['id'], 'new_prefill': target['name'],
+        'external_hit_counter_delta': after - before, 'repeated_request': repeated,
+        'model_restarted_during_extended_check': True}
+
+
+
+def private_output(value):
+    """运行结果只写到私有目录；显式指定输出也不能写回源码仓库。"""
+    path = Path(value)
+    if not path.is_absolute():
+        path = Path(@@ROOT_PY@@) / path
+    config = json.loads((Path(@@ROOT_PY@@) / 'switch-config.json').read_text())
+    repository = Path(config['source_repository']).resolve()
+    if path.is_symlink() or path.resolve().is_relative_to(repository):
+        raise ValueError('运行结果不能写入源码仓库')
+    return str(path)
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--job", type=Path, required=True)
+    args = parser.parse_args()
+    if getattr(args, 'job', None): args.job = private_output(args.job)
+    state = json.loads((args.job / "state.json").read_text())
+    config = json.loads((ROOT / "switch-config.json").read_text())
+    base = config["entry_url"]
+    headers = {"X-GPUStack-Switch": state["gate_token"]}
+    # 如果普通生成未被阻止，不能开始累计指标比较，避免业务流量混入。
+    if request(base + "/v1/chat/completions", {})[0] != 503:
+        raise RuntimeError("扩展检查必须在入口隔离期间执行")
+    spec = importlib.util.spec_from_file_location("local_api", ROOT / "gpustack-local-api.py")
+    api = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api)
+    instances = api.call("GET", "/v2/models/" + str(config['model_id']) + "/instances")["items"]
+    engines = {i["name"]: "http://" + i["worker_ip"] + ":" + str(i["port"])
+        for i in instances if i["role"] in ("prefill", "decode")}
+    # CPU池单独采样；D的external命中包含PD传输，不能代替共享池的实际占用。
+    cache_engines = {}
+    if state['with_cache']:
+        cache_instances = api.call('GET', '/v2/cache-services/' + str(state['cache_id']) + '/instances')['items']
+        worker_ip = next(item['worker_ip'] for item in instances if item['role'] == 'prefill')
+        for item in cache_instances:
+            cache_engines['shared-cache-' + str(item['id'])] = 'http://' + worker_ip + ':' + str(item['ports']['metrics'])
+    before = {}
+    for name, url in engines.items():
+        text, before[name] = metrics(url)
+        (args.job / (name + "-metrics-before.txt")).write_text(text)
+    samples = []
+    overlap_samples = []
+    stop = threading.Event()
+    def monitor():
+        """每两秒采集实际GPU状态和排队、缓存 gauge，不通过日志的十秒均值推断瞬时负载。"""
+        with (args.job / "gpu-and-engine-samples.jsonl").open("w") as log:
+            while not stop.is_set():
+                try:
+                    gpu = subprocess.check_output(["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                        "--format=csv,noheader,nounits"], text=True, timeout=10)
+                    selected = {}
+                    for name, url in {**engines, **cache_engines}.items():
+                        _, values = metrics(url)
+                        selected[name] = {key: value for key, value in values.items() if any(x in key for x in
+                            ["num_requests_running", "num_requests_waiting", "kv_cache_usage", "gpu_cache_usage", "cache_hit",
+                             'lmcache_mp_l1_memory_usage_bytes', 'lmcache_mp_l1_usage_ratio', 'lmcache_mp_l1_staging_bytes'])}
+                    log.write(json.dumps({"at": time.time(), "gpu_csv": gpu, "engines": selected}) + "\n")
+                    log.flush()
+                except Exception as error:
+                    log.write(json.dumps({"at": time.time(), "sample_error": str(error)}) + "\n")
+                    log.flush()
+                stop.wait(2)
+    thread = threading.Thread(target=monitor, daemon=True)
+    thread.start()
+    started = time.monotonic()
+    benchmark_after = {}
+    try:
+        for concurrency, contexts in [(1, [1024, 16384, 98304, 190000]),
+                                      (4, [1024, 16384, 65536, 98304]),
+                                      (12, [1024, 16384, 65536] * 4)]:
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = [pool.submit(generate, base, headers, size, uuid.uuid4().hex, concurrency) for size in contexts]
+                for future in futures:
+                    samples.append(future.result())
+                    # 每个完成结果立即保留，后续某个长请求失败也能追溯前面的实际样本。
+                    with (args.job / "context-request-results.jsonl").open("a") as output:
+                        output.write(json.dumps(samples[-1], ensure_ascii=False) + "\n")
+        if state['target'] == '1p1d-cache':
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(generate, base, headers, size, uuid.uuid4().hex, 8, True)
+                    for size in [1024, 16384, 65536, 98304] * 2]
+                for future in futures:
+                    overlap_samples.append(future.result())
+                    with (args.job / 'overlap-request-results.jsonl').open('a') as output:
+                        output.write(json.dumps(overlap_samples[-1], ensure_ascii=False) + '\n')
+        # 性能阶段计时不包含后续CPU读回和冷启动；P/D计数属于同一段固定的请求集合。
+        benchmark_seconds = time.monotonic() - started
+        # 先固定本轮性能计数；后续缓存读回可能更换模型实例，不能相减不同进程的累计计数。
+        for name, url in engines.items():
+            text, benchmark_after[name] = metrics(url)
+            (args.job / (name + '-metrics-after.txt')).write_text(text)
+        cache_enabled = state["with_cache"]
+        cache_proof = {"enabled": cache_enabled}
+        if cache_enabled:
+            cache_proof = cpu_cache_proof(api, config, state, base, headers, instances, args.job, stop, thread)
+            for name, url in cache_engines.items():
+                text, values = metrics(url)
+                (args.job / (name + '-metrics-after.txt')).write_text(text)
+                cache_proof['pool_gauges_after'] = {key: value for key, value in values.items()
+                    if key.startswith('lmcache_mp_l1_') and not key.endswith(('_total', '_created'))}
+    finally:
+        stop.set()
+        thread.join(timeout=20)
+    elapsed = time.monotonic() - started
+    changes = {}
+    for name, after in benchmark_after.items():
+        changes[name] = {key: value - before[name].get(key, 0) for key, value in after.items()
+            if key.endswith(("_total", "_sum", "_count")) and any(x in key for x in
+                ["prompt_tokens", "generation_tokens", "prefill", "decode", "cache", "spec_decode", "kv_transfer"])}
+    if cache_enabled:
+        if cache_proof.get('external_hit_counter_delta', 0) <= 0:
+            raise RuntimeError("共享缓存未观察到外部命中计数，不能写为验证成功")
+    decode_names = {item['name'] for item in instances if item['role'] == 'decode'}
+    draft_tokens = sum(changes[name].get('vllm:spec_decode_num_draft_tokens_total', 0) for name in decode_names)
+    accepted_tokens = sum(changes[name].get('vllm:spec_decode_num_accepted_tokens_total', 0) for name in decode_names)
+    if draft_tokens <= 0 or accepted_tokens <= 0:
+        raise RuntimeError('Decode没有观察到真实MTP草稿及接受词元')
+    mtp_proof = {'draft_tokens': draft_tokens, 'accepted_tokens': accepted_tokens,
+        'acceptance_ratio': accepted_tokens / draft_tokens}
+    prefill_names = {item['name'] for item in instances if item['role'] == 'prefill'}
+    benchmark_rates = {'prefill_input_tokens_per_second': sum(
+        changes[name].get('vllm:prompt_tokens_total', 0) for name in prefill_names) / benchmark_seconds,
+        'decode_output_tokens_per_second': sum(
+        changes[name].get('vllm:generation_tokens_total', 0) for name in decode_names) / benchmark_seconds,
+        'scope': '隔离后的整个性能阶段墙钟处理率，包含阶段间和D收尾等待；不是纯内核速度，不包含CPU冷启动验收'}
+    groups = {}
+    for concurrency in sorted({item["concurrency"] for item in samples}):
+        subset = [item for item in samples if item["concurrency"] == concurrency]
+        groups[str(concurrency)] = {key: distribution([item[key] for item in subset])
+            for key in ["first_token_seconds", "total_seconds", "decode_tokens_per_second"]}
+    report = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "passed": True,
+        "target": state["target"], "elapsed_seconds": elapsed, 'benchmark_elapsed_seconds': benchmark_seconds,
+        'benchmark_rates': benchmark_rates, "samples": samples,
+        "statistics_by_concurrency": groups, "engine_counter_deltas": changes, "cache_proof": cache_proof,
+        'mtp_proof': mtp_proof,
+        'overlap_requests': overlap_samples,
+        "scope": "合成上下文升级回归；小样本分位数不代表完整生产尾延迟；请求未覆盖模型默认xhigh；包含GPU和引擎原始采样"}
+    (args.job / "extended-verification.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    print(json.dumps({"passed": True, "requests": len(samples), "seconds": elapsed, "cache_proof": cache_proof}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

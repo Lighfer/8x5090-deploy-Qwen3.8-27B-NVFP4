@@ -1,0 +1,129 @@
+{
+  "name": "${COMPOSE_PROJECT_NAME:?Set COMPOSE_PROJECT_NAME}",
+  "services": {
+    "server": {
+      "image": "${GPUSTACK_IMAGE:?Set GPUSTACK_IMAGE in .env}",
+      "pull_policy": "never",
+      "container_name": "${GPUSTACK_SERVER_CONTAINER:?Set GPUSTACK_SERVER_CONTAINER}",
+      "restart": "unless-stopped",
+      "runtime": "runc",
+      "ports": [
+        "${GPUSTACK_HOST_IP:?Set GPUSTACK_HOST_IP}:${GPUSTACK_HTTP_PORT:?Set GPUSTACK_HTTP_PORT}:80"
+      ],
+      "environment": {
+        "GPUSTACK_SERVER_EXTERNAL_URL": "http://${GPUSTACK_HOST_IP}:${GPUSTACK_HTTP_PORT:?Set GPUSTACK_HTTP_PORT}",
+        "GPUSTACK_ENABLE_WORKER": "false",
+        "GPUSTACK_DISABLE_WORKER": "true",
+        "NVIDIA_VISIBLE_DEVICES": "void"
+      },
+      "volumes": [
+        "server-data:/var/lib/gpustack"
+      ],
+      "ulimits": {
+        "nofile": {
+          "soft": 65535,
+          "hard": 65535
+        }
+      },
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "curl",
+          "--fail",
+          "--silent",
+          "--show-error",
+          "http://127.0.0.1:30080/healthz"
+        ],
+        "interval": "10s",
+        "timeout": "5s",
+        "retries": 30,
+        "start_period": "120s"
+      }
+    },
+    "worker": {
+      "image": "${GPUSTACK_IMAGE:?Set GPUSTACK_IMAGE in .env}",
+      "pull_policy": "never",
+      "container_name": "${GPUSTACK_WORKER_CONTAINER:?Set GPUSTACK_WORKER_CONTAINER}",
+      "restart": "unless-stopped",
+      "privileged": true,
+      "network_mode": "host",
+      "runtime": "nvidia",
+      "depends_on": {
+        "server": {
+          "condition": "service_healthy"
+        }
+      },
+      "environment": {
+        "GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES": "/usr/local/lib/python3.11/dist-packages/gpustack_runtime/deployer/docker.py",
+        "GPUSTACK_TOKEN": "${GPUSTACK_TOKEN:-}",
+        "GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT": "true",
+        "GPUSTACK_RUNTIME_DEPLOY_MIRRORED_NAME": "${GPUSTACK_WORKER_CONTAINER:?Set GPUSTACK_WORKER_CONTAINER}",
+        "GPUSTACK_RUNTIME_DEPLOY_IMAGE_PULL_POLICY": "${GPUSTACK_RUNTIME_IMAGE_PULL_POLICY:-Never}",
+        "GPUSTACK_RUNTIME_DOCKER_PAUSE_IMAGE": "${GPUSTACK_PAUSE_IMAGE:-gpustack/runtime:pause}",
+        "GPUSTACK_RUNTIME_DOCKER_UNHEALTHY_RESTART_IMAGE": "${GPUSTACK_HEALTH_IMAGE:-gpustack/runtime:health}",
+        "GPUSTACK_HOST_IPC": "${GPUSTACK_HOST_IPC:-true}",
+        "NVIDIA_VISIBLE_DEVICES": "all",
+        "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+        "CUDA_DEVICE_ORDER": "${CUDA_DEVICE_ORDER:-PCI_BUS_ID}",
+        "CUDA_MODULE_LOADING": "${CUDA_MODULE_LOADING:-LAZY}",
+        "PYTHONHASHSEED": "${PYTHONHASHSEED:-0}",
+        "NCCL_P2P_DISABLE": "${NCCL_P2P_DISABLE:-0}",
+        "NCCL_P2P_LEVEL": "${NCCL_P2P_LEVEL:-SYS}",
+        "VLLM_USE_V2_MODEL_RUNNER": "${VLLM_USE_V2_MODEL_RUNNER:-1}",
+        "VLLM_SM12X_DRAFT_UB_PLAN": "${VLLM_SM12X_DRAFT_UB_PLAN:-1}",
+        "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": "${VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE:-536870912}",
+        "TORCHINDUCTOR_COMPILE_THREADS": "${TORCHINDUCTOR_COMPILE_THREADS:-4}",
+        "MAX_JOBS": "${MAX_JOBS:-4}",
+        "FLASHINFER_NUM_COMPILE_JOBS": "${FLASHINFER_NUM_COMPILE_JOBS:-4}"
+      },
+      "volumes": [
+        "/var/run/docker.sock:/var/run/docker.sock",
+        "worker-data:/var/lib/gpustack",
+        {
+          "type": "bind",
+          "source": "./worker/docker.py",
+          "target": "/usr/local/lib/python3.11/dist-packages/gpustack_runtime/deployer/docker.py",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${GPUSTACK_MODEL_PARENT:?Set GPUSTACK_MODEL_PARENT}",
+          "target": "${GPUSTACK_MODEL_PARENT:?Set GPUSTACK_MODEL_PARENT}",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "command": [
+        "--server-url",
+        "http://${GPUSTACK_HOST_IP}:${GPUSTACK_HTTP_PORT:?Set GPUSTACK_HTTP_PORT}",
+        "--worker-name",
+        "${GPUSTACK_WORKER_NAME:?Set GPUSTACK_WORKER_NAME}",
+        "--worker-ip",
+        "${GPUSTACK_HOST_IP}",
+        "--advertise-address",
+        "${GPUSTACK_HOST_IP}",
+        "--kv-transfer-ifname",
+        "${GPUSTACK_KV_TRANSFER_IFNAME:-}",
+        "--worker-port",
+        "${GPUSTACK_WORKER_PORT:?Set GPUSTACK_WORKER_PORT}",
+        "--worker-metrics-port",
+        "${GPUSTACK_WORKER_METRICS_PORT:?Set GPUSTACK_WORKER_METRICS_PORT}",
+        "--service-port-range",
+        "${GPUSTACK_SERVICE_PORT_RANGE:?Set GPUSTACK_SERVICE_PORT_RANGE}"
+      ]
+    }
+  },
+  "volumes": {
+    "server-data": {
+      "name": "${GPUSTACK_SERVER_VOLUME:?Set GPUSTACK_SERVER_VOLUME}"
+    },
+    "worker-data": {
+      "name": "${GPUSTACK_WORKER_VOLUME:?Set GPUSTACK_WORKER_VOLUME}"
+    }
+  }
+}

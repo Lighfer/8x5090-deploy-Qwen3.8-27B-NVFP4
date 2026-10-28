@@ -534,10 +534,105 @@ class SwitchingTests(unittest.TestCase):
     def test_six_gpu_cache_server_also_excludes_reserved_cards(self):
         host, task = self.prepare('1p1d-cache', '1p2d-6gpu-cache')
         definition = switch.read_json(task.job / 'target-cache.json')
-        self.assertEqual(definition['config']['env']['CUDA_VISIBLE_DEVICES'], ','.join(map(str, self.site['gpus']['six_card_order'])))
+        self.assertEqual(definition['config']['env']['CUDA_VISIBLE_DEVICES'], ','.join(map(str, sorted(self.site['gpus']['six_card_order'][:2]))))
         role = {r['name']: r for r in switch.read_json(task.job / 'target-profile.json')['roles']}
         self.assertEqual(role['prefill']['gpu_selector']['gpu_ids'], [self.site['names']['node'] + ':cuda:' + str(i) for i in self.site['gpus']['six_card_order'][:2]])
         self.assertEqual(role['decode']['gpu_selector']['gpu_ids'], [self.site['names']['node'] + ':cuda:' + str(i) for i in self.site['gpus']['six_card_order'][2:]])
+
+    def test_cache_uses_only_prefill_gpu_set_in_eight_gpu_mode(self):
+        """CPU池的上下文不需要覆盖Decode卡，亲和性应来自实际Prefill选择器。"""
+        host, task = self.prepare('1p1d-cache', '2p2d-cache')
+        definition = switch.read_json(task.job / 'target-cache.json')
+        profile = switch.read_json(task.job / 'target-profile.json')
+        role = next(r for r in profile['roles'] if r['name'] == 'prefill')
+        expected = sorted(int(g.rsplit(':', 1)[1]) for g in role['gpu_selector']['gpu_ids'])
+        self.assertEqual(definition['config']['env']['CUDA_VISIBLE_DEVICES'], ','.join(map(str, expected)))
+
+    def test_registered_complete_old_profile_can_stop_after_file_upgrade(self):
+        """旧容器参数只有完整签名和镜像同时匹配，才能跨越文件先升级的过渡期。"""
+        host = FakeHost(self.root, '2p2d-cache')
+        old = copy.deepcopy(host.model)
+        old['env']['CUTE_DSL_CACHE_DIR'] = '/tmp/synthetic-old-kernel-cache'
+        host.model = old
+        reference = old['image_name']
+        host.config['previous_profile_signatures'] = {'2p2d-cache': [{
+            'signature': switch.profile_signature(old), 'image_name': reference,
+            'image_id': host.config['image_ids'][reference]}]}
+        self.assertEqual(switch.identify_mode(host, old), '2p2d-cache')
+        old['env']['UNKNOWN_SETTING'] = 'changed'
+        with self.assertRaises(switch.SwitchError):
+            switch.identify_mode(host, old)
+
+    def test_required_drain_timeout_restores_entry_without_model_mutation(self):
+        # 零秒期限确定性触发超时；入口隔离必须撤销，模型和缓存不允许进入停止阶段。
+        host, task = self.prepare('1p1d-cache', '2p2d-cache')
+        before_model = copy.deepcopy(host.model)
+        before_cache = copy.deepcopy(host.caches)
+        task.save(require_drained=True)
+        task.execute()
+        self.assertEqual(task.state['phase'], 'rolled-back')
+        self.assertFalse(task.state['model_mutation_intent'])
+        self.assertEqual(host.model, before_model)
+        self.assertEqual(host.caches, before_cache)
+        self.assertNotIn(switch.MARKER, host.active_nginx)
+
+    def test_target_keeps_disabled_restart_policy(self):
+        # 更新部署参数必须继承原模型策略，不能隐式打开平台局部自动重启。
+        host, task = self.prepare('1p1d-cache', '2p2d-cache')
+        before = switch.read_json(task.job / 'model-before.json')
+        before['restart_on_error'] = False
+        switch.write_json(task.job / 'model-before.json', before)
+        self.assertIs(task.target(11)['restart_on_error'], False)
+
+    def test_gpu_pool_requires_explicit_cards_per_replica(self):
+        """候选池大小不能代替实例TP，遗漏原生每副本卡数字段必须在隔离前拒绝。"""
+        host = FakeHost(self.root, '1p1d-cache')
+        path = self.root / 'switch-profiles/2p2d-cache.json'
+        profile = switch.read_json(path)
+        prefill = next(r for r in profile['roles'] if r['name'] == 'prefill')
+        prefill['gpu_selector'].pop('gpus_per_replica')
+        switch.write_json(path, profile)
+        host.config['profile_sha256']['2p2d-cache'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(switch.SwitchError, '每个副本'):
+            switch.preflight(host, '2p2d-cache')
+        self.assertEqual(host.changes, [])
+
+    def test_gpu_pool_wrong_cards_per_replica_is_rejected(self):
+        """显式卡数也必须和推理并行参数相符，不能通过跳过数量检查掩盖冲突。"""
+        host = FakeHost(self.root, '1p1d-cache')
+        path = self.root / 'switch-profiles/2p2d-cache.json'
+        profile = switch.read_json(path)
+        decode = next(r for r in profile['roles'] if r['name'] == 'decode')
+        decode['gpu_selector']['gpus_per_replica'] = 4
+        switch.write_json(path, profile)
+        host.config['profile_sha256']['2p2d-cache'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(switch.SwitchError, '每个副本'):
+            switch.preflight(host, '2p2d-cache')
+        self.assertEqual(host.changes, [])
+
+    def test_valid_gpu_pool_separates_total_and_per_replica(self):
+        """两副本TP2共用四卡候选池，每副本声明两卡，六卡方案的D同样成立。"""
+        host = FakeHost(self.root, '1p1d-cache')
+        for mode in ('2p2d-cache', '1p2d-6gpu-cache'):
+            result = switch.preflight(host, mode)
+            for role in result['profile']['roles']:
+                if role['name'] not in ('prefill', 'decode'):
+                    continue
+                selector = role['gpu_selector']
+                self.assertEqual(selector['gpus_per_replica'], 2)
+                self.assertEqual(len(selector['gpu_ids']), 2 * role['replicas'])
+
+    def test_numa_without_explicit_nodes_is_rejected_before_gate(self):
+        host = FakeHost(self.root, '1p1d-cache')
+        path = self.root / 'switch-profiles/2p2d-cache.json'
+        profile = switch.read_json(path)
+        prefill = next(r for r in profile['roles'] if r['name'] == 'prefill')
+        prefill['backend_parameters'].append('--numa-bind')
+        switch.write_json(path, profile)
+        host.config['profile_sha256']['2p2d-cache'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(switch.SwitchError, '显式节点'):
+            switch.preflight(host, '2p2d-cache')
+        self.assertEqual(host.changes, [])
 
     def test_start_from_stopped_does_not_wait_for_nonexistent_requests(self):
         host, task = self.prepare('1p1d-no-cache', '1p1d-no-cache')

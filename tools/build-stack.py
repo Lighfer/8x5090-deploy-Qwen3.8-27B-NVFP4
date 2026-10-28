@@ -37,6 +37,21 @@ def source_archive(directory, expected, opener):
     target.write_bytes(content)
 
 
+def lmcache_archive(directory, record, opener, local=None):
+    """取得固定LMCache源码；支持仓库外预下载输入，不保存源码包到公开仓库。"""
+    if local is not None:
+        content = outside_repository(local).read_bytes()
+    else:
+        address = urlsplit(record['url'])
+        if address.scheme != 'https' or address.hostname != 'files.pythonhosted.org':
+            raise RuntimeError('LMCache源码地址不是固定官方发布源')
+        with opener.open(record['url'], timeout=60) as response:
+            content = response.read(32 * 1024 * 1024)
+    if len(content) != record['size'] or hashlib.sha256(content).hexdigest() != record['sha256']:
+        raise RuntimeError('LMCache源码体积或散列不符')
+    (directory / 'lmcache-0.5.6.tar.gz').write_bytes(content)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--work', required=True, help='不存在且位于仓库之外的本次构建目录')
@@ -47,6 +62,7 @@ def main():
     parser.add_argument('--variant', choices=('current', 'legacy'), default='current')
     parser.add_argument('--runtime-only', action='store_true')
     parser.add_argument('--proxy', help='可选回环HTTP下载代理；不改主机网络或写入镜像配置')
+    parser.add_argument('--lmcache-archive', help='可选的仓库外LMCache固定源码包，用于已预下载场景')
     parser.add_argument('--execute', action='store_true')
     args = parser.parse_args()
     work = outside_repository(args.work, may_exist=False)
@@ -54,6 +70,8 @@ def main():
         parser.error('镜像前缀或版本后缀格式不合法')
     if args.variant == 'legacy' and not args.runtime_only:
         parser.error('legacy仅用于独立兼容运行镜像；Router沿用其单独固定的配方')
+    if args.variant == 'current' and args.memory_gib < 8:
+        parser.error('当前版本需要重建LMCache CUDA扩展，构建内存限额至少8GiB')
     tags = [args.prefix + ':' + args.release + '-runtime', args.prefix + ':' + args.release + '-router']
     if args.runtime_only:
         tags = tags[:1]
@@ -95,6 +113,8 @@ def main():
     shutil.copytree(ROOT / 'sources/vllm', runtime)
     if args.variant == 'legacy':
         shutil.copyfile(runtime / 'Dockerfile.legacy', runtime / 'Dockerfile')
+    else:
+        lmcache_archive(runtime, lock['lmcache_cuda_source'], opener, args.lmcache_archive)
     # 构建器只读取已经核对的本地别名；引用名由本次发布选择，内容仍锁定公开摘要。
     base_alias = args.prefix + ':' + args.release + '-base'
     run(['docker', 'tag', base, base_alias])

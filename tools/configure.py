@@ -74,13 +74,22 @@ def checked_site(path):
             raise ValueError('必须明确提供安全的资源名称：' + key)
     if len({site['names'][k] for k in ('server', 'worker', 'proxy')}) != 3:
         raise ValueError('容器名称必须互不重复')
-    require_keys(site['gpus'], {'eight_card_order', 'six_card_order'}, 'gpus')
+    # NUMA映射可以不提供；没有可靠拓扑时保持不绑定，不让受限CPU集合触发自动检测失败。
+    gpu_keys = {'eight_card_order', 'six_card_order'}
+    if 'numa_nodes' in site['gpus']:
+        gpu_keys.add('numa_nodes')
+    require_keys(site['gpus'], gpu_keys, 'gpus')
     for key, count in [('eight_card_order', 8), ('six_card_order', 6)]:
         values = site['gpus'][key]
         if not isinstance(values, list) or len(values) != count or len(set(values)) != count or any(type(v) is not int or v < 0 for v in values):
             raise ValueError('必须提供数量正确且无重复的实际GPU序号：' + key)
     if not set(site['gpus']['six_card_order']) <= set(site['gpus']['eight_card_order']):
         raise ValueError('六卡集合必须来自已授权的八卡集合')
+    numa = site['gpus'].get('numa_nodes')
+    if numa is not None and (not isinstance(numa, dict)
+            or set(numa) != {str(i) for i in site['gpus']['eight_card_order']}
+            or any(type(v) is not int or v < 0 for v in numa.values())):
+        raise ValueError('NUMA映射必须完整覆盖授权八卡，键为GPU序号字符串，值为已核验的节点整数')
     require_keys(site['resources'], {'cache_gib', 'minimum_free_gib'}, 'resources')
     if any(type(v) is not int or v <= 0 for v in site['resources'].values()):
         raise ValueError('缓存容量和最低空闲内存必须由用户明确提供')
@@ -172,6 +181,29 @@ def bytes_json(value):
     return (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode()
 
 
+def apply_numa_binding(profile, nodes):
+    """仅为同一NUMA节点内的角色显式绑定，避免多副本被分到不同节点后套用错误映射。
+
+    vLLM按实例内可见GPU的逻辑序号读取节点列表。角色候选池跨节点时，静态列表无法
+    表达不同副本的实际分配，因而不绑定该角色；不猜测调度器将如何切分候选池。
+    """
+    for scope in [profile, *profile['roles']]:
+        if scope.get('name') == 'router':
+            continue
+        scope['backend_parameters'] = [v for v in scope.get('backend_parameters', []) if v != '--numa-bind']
+    if nodes is None:
+        return profile
+    for role in profile['roles']:
+        if role['name'] not in ('prefill', 'decode'):
+            continue
+        selected = role['gpu_selector']['gpu_ids']
+        placement = {nodes[g.rsplit(':', 1)[1]] for g in selected}
+        if len(placement) == 1:
+            count = role['gpu_selector']['gpus_per_replica']
+            role['backend_parameters'].extend(['--numa-bind', '--numa-bind-nodes', *([str(next(iter(placement)))] * count)])
+    return profile
+
+
 def generated_files(site, target, image_ids):
     """构造全部输出后再落盘；所有路径和身份只存在于输出，不反写源码模板。"""
     result = {}
@@ -197,6 +229,7 @@ def generated_files(site, target, image_ids):
              '2p2d-cache': 'pd-model-2p2d-stopped', '1p2d-6gpu-cache': 'pd-model-1p2d-6gpu-stopped'}
     for mode in MODES:
         profile = replace_values(read_json(ROOT / 'recipes' / (mode + '.json')), model_values(site, mode))
+        apply_numa_binding(profile, site['gpus'].get('numa_nodes'))
         data = bytes_json(profile)
         result['switch-profiles/' + mode + '.json'] = data
         hashes[mode] = hashlib.sha256(data).hexdigest()

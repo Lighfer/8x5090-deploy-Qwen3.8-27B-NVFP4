@@ -1,0 +1,16 @@
+[Unit]
+Description=Apply a prepared GPUStack release after reboot
+After=docker.service network-online.target gpustack-pd-switch-recover.service
+Wants=docker.service network-online.target gpustack-pd-switch-recover.service
+ConditionPathExists=@@ROOT_SYSTEMD@@/next-start-release.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 @@ROOT_SYSTEMD@@/next-start.py --boot
+TimeoutStartSec=4500
+Restart=no
+Nice=10
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

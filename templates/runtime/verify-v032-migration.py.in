@@ -138,6 +138,16 @@ def external_hits(url):
     return values.get('vllm:external_prefix_cache_hits_total', 0), text
 
 
+def settled_external_hits(url, before, timeout=15):
+    """等待实际计数发布，保持命中必须增加的条件，不将日志采样延迟误判成缓存失败。"""
+    deadline=time.monotonic()+timeout
+    after,raw=external_hits(url)
+    while after<=before and time.monotonic()<deadline:
+        time.sleep(.5)
+        after,raw=external_hits(url)
+    return after,raw
+
+
 def cpu_cache_proof(api, config, state, base, headers, instances, job, stop, thread):
     """通过另一P或GPU缓存冷启动验证CPU读回，保持生产开发接口关闭。"""
     prefills = [item for item in instances if item['role'] == 'prefill']
@@ -153,7 +163,7 @@ def cpu_cache_proof(api, config, state, base, headers, instances, job, stop, thr
         generate(first_url, {}, 16384, nonce, 1)
         time.sleep(3)
         repeated = generate(second_url, {}, 16384, nonce, 1)
-        after, raw = external_hits(second_url)
+        after, raw = settled_external_hits(second_url, before)
         (job / 'cpu-proof-after.txt').write_text(raw)
         return {'enabled': True, 'method': 'cross_prefill_same_cpu_pool',
             'source_prefill': first['name'], 'retrieving_prefill': second['name'],
@@ -171,7 +181,7 @@ def cpu_cache_proof(api, config, state, base, headers, instances, job, stop, thr
     before, raw = external_hits(prefill_url)
     (job / 'cpu-proof-before.txt').write_text(raw)
     repeated = generate(base, headers, 33792, nonce, 1, prompt_override=branch_prompt)
-    after, raw = external_hits(prefill_url)
+    after, raw = settled_external_hits(prefill_url, before)
     if after > before:
         (job / 'cpu-proof-after.txt').write_text(raw)
         return {'enabled': True, 'method': 'earlier_shared_prefix_checkpoint',
@@ -204,7 +214,7 @@ def cpu_cache_proof(api, config, state, base, headers, instances, job, stop, thr
     before, raw = external_hits(prefill_url)
     (job / 'cpu-cold-restart-before.txt').write_text(raw)
     repeated = generate(base, headers, 131072, nonce, 1, prompt_override=warm_prompt)
-    after, raw = external_hits(prefill_url)
+    after, raw = settled_external_hits(prefill_url, before)
     (job / 'cpu-proof-after.txt').write_text(raw)
     cache_after = api.call('GET', '/v2/cache-services/' + str(state['cache_id']))
     assert cache_before['id'] == cache_after['id'] and cache_after['healthy'] is True

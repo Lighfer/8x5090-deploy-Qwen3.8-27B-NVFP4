@@ -115,6 +115,39 @@ class ConfigureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             configure.prepare(self.path)
 
+    def test_missing_numa_mapping_keeps_binding_disabled(self):
+        result = configure.generated_files(self.site, Path(self.site['paths']['deployment']), fake_images(self.site))
+        for mode in configure.MODES:
+            profile = json.loads(result['switch-profiles/' + mode + '.json'])
+            for scope in [profile, *profile['roles']]:
+                self.assertNotIn('--numa-bind', scope.get('backend_parameters', []))
+
+    def test_explicit_numa_mapping_binds_only_homogeneous_role_pools(self):
+        order = self.site['gpus']['eight_card_order']
+        self.site['gpus']['numa_nodes'] = {str(g): index // 4 for index, g in enumerate(order)}
+        self.store()
+        configure.checked_site(self.path)
+        result = configure.generated_files(self.site, Path(self.site['paths']['deployment']), fake_images(self.site))
+        profile = json.loads(result['switch-profiles/2p2d-cache.json'])
+        for role in profile['roles']:
+            if role['name'] in ('prefill', 'decode'):
+                args = role['backend_parameters']
+                start = args.index('--numa-bind-nodes') + 1
+                expected = str(self.site['gpus']['numa_nodes'][role['gpu_selector']['gpu_ids'][0].rsplit(':', 1)[1]])
+                self.assertEqual(args[start:], [expected] * 2)
+        six = json.loads(result['switch-profiles/1p2d-6gpu-cache.json'])
+        for role in six['roles']:
+            selected = (role.get('gpu_selector') or {}).get('gpu_ids', [])
+            nodes = {self.site['gpus']['numa_nodes'][g.rsplit(':', 1)[1]] for g in selected}
+            if len(nodes) > 1:
+                self.assertNotIn('--numa-bind', role['backend_parameters'])
+
+    def test_partial_numa_mapping_is_rejected(self):
+        self.site['gpus']['numa_nodes'] = {}
+        self.store()
+        with self.assertRaises(ValueError):
+            configure.checked_site(self.path)
+
     def test_child_symlink_is_rejected_before_registration_writes(self):
         configure.prepare(self.path, execute=True, image_reader=fake_images)
         target = Path(self.site['paths']['deployment'])

@@ -1,0 +1,185 @@
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -20,7 +20,7 @@
+     from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
+     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+     from vllm.lora.request import LoRARequest
+-    from vllm.multimodal.inputs import MultiModalFeatureSpec
++    from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
+     from vllm.pooling_params import PoolingParams
+     from vllm.sampling_params import SamplingParams
+     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+@@ -262,6 +262,13 @@ class SchedulerOutput:
+     # freed from the encoder cache.
+     free_encoder_mm_hashes: list[str]
+ 
++    # Request-local CPU payload updates: None releases a consumed input; a
++    # payload restores it for re-encoding after KV-load rollback. GPU embeddings
++    # and the feature's identifier/placeholder metadata are unaffected.
++    encoder_input_updates: dict[str, dict[int, "MultiModalKwargsItem | None"]] = field(
++        default_factory=dict
++    )
++
+     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
+ 
+     # Request IDs that are preempted in this step.
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -29,6 +29,7 @@
+ from vllm.logger import init_logger
+ from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
+ from vllm.multimodal.encoder_budget import MultiModalBudget
++from vllm.multimodal.inputs import MultiModalKwargsItem
+ from vllm.multimodal.utils import get_mm_features_in_window
+ from vllm.outputs import RequestError
+ from vllm.utils.math_utils import cdiv
+@@ -377,6 +378,7 @@ def __init__(
+ 
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+         self.use_v2_model_runner = vllm_config.use_v2_model_runner
++        self._pending_encoder_input_ids: dict[str, set[int]] = {}
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+         self.current_step = 0
+@@ -1709,6 +1711,9 @@ def skip_request(from_queue: RequestQueue) -> None:
+             # the previous and the current steps.
+             finished_req_ids=self.finished_req_ids,
+             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
++            encoder_input_updates=self._get_encoder_input_updates(
++                num_scheduled_tokens, new_reqs_data, scheduled_encoder_inputs
++            ),
+             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
+             has_sync_kv_loads=has_sync_kv_loads,
+             kv_cache_block_copies=pending_kv_cache_block_copies,
+@@ -1785,6 +1790,7 @@ def _preempt_request(
+             self.aux_output_connector.request_finished(request)
+         self._free_request_blocks(request)
+         self.encoder_cache_manager.free(request)
++        self._pending_encoder_input_ids.pop(request.request_id, None)
+         self._inflight_prefills.discard(request)
+         request.status = RequestStatus.PREEMPTED
+         request.num_computed_tokens = 0
+@@ -2736,6 +2742,62 @@ def _update_request_with_output(
+             assert request.num_output_placeholders >= 0
+         return new_token_ids, stopped
+ 
++    def _get_encoder_input_updates(
++        self,
++        scheduled: dict[str, int],
++        new_requests: list[NewRequestData],
++        scheduled_encoder_inputs: dict[str, list[int]],
++    ) -> dict[str, dict[int, MultiModalKwargsItem | None]]:
++        if not self.use_v2_model_runner:
++            return {}
++        # Installations (including resume/streaming) replace worker features.
++        # SHM descriptors follow the processor cache's separate ACK protocol;
++        # EngineCore cannot replay their resolved tensors.
++        for new_request in new_requests:
++            if not new_request.mm_features:
++                continue
++            self._pending_encoder_input_ids[new_request.req_id] = {
++                i
++                for i, feature in enumerate(new_request.mm_features)
++                if feature.data is not None and "address" not in feature.data
++            }
++
++        updates: dict[str, dict[int, MultiModalKwargsItem | None]] = {}
++        for req_id in scheduled:
++            request = self.requests[req_id]
++            pending = self._pending_encoder_input_ids.get(req_id)
++            if pending is None:
++                continue
++            encoding = scheduled_encoder_inputs.get(req_id, ())
++            if not pending and not encoding:
++                continue
++            for input_id in encoding:
++                data = request.mm_features[input_id].data
++                if (
++                    input_id not in pending
++                    and data is not None
++                    and "address" not in data
++                ):
++                    # A running request may rewind without being reinstalled.
++                    updates.setdefault(req_id, {})[input_id] = data
++                    pending.add(input_id)
++
++            # schedule() advances progress before execution. Exclude in-flight
++            # prefill and speculative placeholders to obtain confirmed progress.
++            computed = request.num_computed_tokens - max(
++                request.num_output_placeholders, request.num_in_flight_tokens
++            )
++            for input_id in list(pending):
++                if input_id in encoding:
++                    continue
++                position = request.mm_features[input_id].mm_position
++                if position.offset + position.length <= computed or (
++                    self.is_encoder_decoder and computed > 0
++                ):
++                    updates.setdefault(req_id, {})[input_id] = None
++                    pending.remove(input_id)
++        return updates
++
+     def _free_encoder_inputs(self, request: Request) -> None:
+         cached_encoder_input_ids = self.encoder_cache_manager.get_cached_input_ids(
+             request
+@@ -2958,6 +3020,7 @@ def _free_request(
+             connector_delay_free_blocks |= ec_delay_free
+ 
+         self.encoder_cache_manager.free(request)
++        self._pending_encoder_input_ids.pop(request.request_id, None)
+         request_id = request.request_id
+         self.finished_req_ids.add(request_id)
+         if self.finished_req_ids_dict is not None:
+diff --git a/vllm/v1/worker/gpu/mm/encoder_cache.py b/vllm/v1/worker/gpu/mm/encoder_cache.py
+--- a/vllm/v1/worker/gpu/mm/encoder_cache.py
++++ b/vllm/v1/worker/gpu/mm/encoder_cache.py
+@@ -1,8 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from dataclasses import replace
++
+ import torch
+ 
+-from vllm.multimodal.inputs import MultiModalFeatureSpec
++from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
+ 
+ 
+ class EncoderCache:
+@@ -18,11 +20,20 @@ def __len__(self) -> int:
+     def add_request(
+         self, req_id: str, mm_features: list[MultiModalFeatureSpec]
+     ) -> None:
+-        self.mm_features[req_id] = mm_features
++        # The uniprocess executor can share this list with EngineCore.
++        self.mm_features[req_id] = list(mm_features)
+ 
+     def remove_request(self, req_id: str) -> None:
+         self.mm_features.pop(req_id, None)
+ 
++    def update_encoder_inputs(
++        self, req_id: str, updates: dict[int, MultiModalKwargsItem | None]
++    ) -> None:
++        features = self.mm_features[req_id]
++        for input_id, data in updates.items():
++            # Replace entries so EngineCore keeps its original payload for replay.
++            features[input_id] = replace(features[input_id], data=data)
++
+     def reset_mm_cache(self) -> None:
+         """Clear the multi-modal cache that was used during profiling,
+         but no longer needed during inference.
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1770,6 +1770,10 @@ def execute_model(
+             self.free_states(scheduler_output)
+             self.add_requests(scheduler_output)
+             self.update_requests(scheduler_output)
++            if self.encoder_cache is not None:
++                # add_requests initializes RoPE positions from CPU metadata first.
++                for req_id, updates in scheduler_output.encoder_input_updates.items():
++                    self.encoder_cache.update_encoder_inputs(req_id, updates)
+             self.block_tables.apply_staged_writes()
+             if self.aux_output_connector is not None:
+                 # Register this step before the GPU forward.

@@ -223,6 +223,21 @@ def identify_mode(host, model):
         if signature == profile_signature(profiles[mode]):
             if not model.get('replicas') or cached == (mode != '1p1d-no-cache'):
                 return mode
+    # 配置文件可以先于运行容器升级。过渡期只接受完整登记的旧参数签名及镜像身份，
+    # 不通过忽略NUMA、缓存目录或通信参数来宽松识别未知的网页修改。
+    for mode, entries in host.config.get('previous_profile_signatures', {}).items():
+        if mode not in MODES:
+            raise SwitchError('旧方案登记包含未知方案。')
+        for entry in entries:
+            if signature != entry['signature'] or (model.get('replicas') and cached != (mode != '1p1d-no-cache')):
+                continue
+            reference, expected = entry['image_name'], entry['image_id']
+            if host.config.get('image_ids', {}).get(reference) != expected:
+                raise SwitchError('旧方案镜像未登记到固定身份清单。')
+            actual = host.run(['docker', 'image', 'inspect', '--format', '{{.Id}}', reference], timeout=30).strip()
+            if actual != expected:
+                raise SwitchError('旧方案镜像内容已变化。')
+            return mode
     # 文件更新不会立即替换正在运行的引擎。只允许逐项登记的旧镜像跨越此过渡期，
     # 否则更新模板后，旧引擎连stop都无法识别。除了顶层推理镜像，其余性能参数、
     # 角色、路由镜像、显卡选择和缓存启用状态仍全部严格比较，不接受未知网页配置。
@@ -380,6 +395,30 @@ class Host:
                 "all_gpus": report["gpu_assignment_complete_and_disjoint"]}
 
 
+def owns_model_container(config, container):
+    """依据GPUStack工作负载标签确定本模型归属，开机接管与普通切换共用相同规则。"""
+    workload = (container.get('Config', {}).get('Labels') or {}).get('runtime.gpustack.ai/workload', '')
+    return re.fullmatch(re.escape(config['model_name']) + r'-(prefill|decode|router)-[a-z0-9]+', workload) is not None
+
+
+def prepared_release_module(root):
+    """仅在存在预备记录时加载本地升级协调器；普通安装不依赖预备状态。"""
+    if not (Path(root) / 'next-start-release.json').exists():
+        return None
+    spec = importlib.util.spec_from_file_location('gpustack_prepared_release', Path(root) / 'next-start.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def complete_prepared_release(host, successful, job):
+    """切换失败恢复本次登记的旧文件；只有实际使用该预备版本的事务可以改状态。"""
+    module = prepared_release_module(host.root)
+    if module is not None:
+        module.complete(host.root, successful, job.name)
+        host.config = read_json(host.root / 'switch-config.json')
+
+
 class Switch:
     """一份事务对应一次快照，恢复过程可以在主进程结束后独立重入。"""
 
@@ -412,8 +451,7 @@ class Switch:
 
     def owned_model(self, container):
         """工作负载名称匹配完整模型及角色，不能波及其他模型或业务容器。"""
-        workload = (container.get("Config", {}).get("Labels") or {}).get("runtime.gpustack.ai/workload", "")
-        return re.fullmatch(re.escape(self.config["model_name"]) + r"-(prefill|decode|router)-[a-z0-9]+", workload) is not None
+        return owns_model_container(self.config, container)
 
     def owned_cache(self, container):
         """此版本只管理 LMCache 单组件 server，避免按模糊名称删除其他缓存。"""
@@ -486,6 +524,18 @@ class Switch:
         """直接检查引擎计数，连续空闲后停止；故障或超时最多等待配置中的排空时限。"""
         timeout = self.state["drain_timeout"]
         self.event("等待在途请求结束，最长 " + str(timeout) + " 秒")
+        marker = self.root / 'next-start-release.json'
+        if marker.exists():
+            plan = read_json(marker)
+            # P/D可配置为不自动重启，数据库实例记录却仍可能留在重启前的状态。
+            # 只在本次开机待升级事务已绑定，且实际没有任何本模型容器时跳过空等。
+            # 入口已在上一步隔离；若仍有任意模型容器，继续读取队列并严格排空。
+            if (plan.get('phase') == 'activating' and plan.get('activation_job') == self.job.name
+                    and bool(plan.get('prepared_boot_id'))
+                    and plan.get('prepared_boot_id') != self.host.boot_id()
+                    and not any(self.owned_model(c) for c in self.host.containers())):
+                self.event('开机后本模型没有运行容器，旧请求已结束，接管原实例记录并启动预备版本')
+                return
         deadline = time.monotonic() + timeout
         idle = 0
         while time.monotonic() < deadline:
@@ -512,6 +562,8 @@ class Switch:
                 self.event("引擎已连续空闲")
                 return
             self.host.sleep(2)
+        if self.state.get("require_drained"):
+            raise SwitchError("排空超时，取消切换并恢复入口；不会停止仍有请求的模型。")
         self.event("排空时限已到，将停止本模型；未结束的旧请求会中断")
 
     def stop_model(self):
@@ -594,7 +646,8 @@ class Switch:
             if role["name"] == "prefill" and cache_id is not None:
                 role["extended_kv_cache"] = {"enabled": True, "mode": "shared",
                     "cache_service_id": cache_id, "chunk_size": self.config["chunk_size"]}
-        model.update(replicas=1, restart_on_error=True, extended_kv_cache=disabled_cache())
+        # 保留原模型的故障重启策略，避免参数维护时意外启用局部自动重启。
+        model.update(replicas=1, restart_on_error=bool(model.get("restart_on_error", False)), extended_kv_cache=disabled_cache())
         return model
 
     def ready(self, model, rollback=False):
@@ -617,6 +670,10 @@ class Switch:
                     if item.get('role') not in ('prefill', 'decode'):
                         continue
                     log = self.host.container_logs(item['name'] + '-run-0', self.state['created_at'])
+                    # 平台会回收失败容器，加载期间保留有界日志，供回滚后核对完整异常。
+                    # 这些日志只写到私有事务目录，不进入公开源码仓库。
+                    if log:
+                        atomic_file(self.job / ('startup-' + item['name'] + '.log'), log)
                     if re.search(r'memory allocation failed with OOM|torch\.OutOfMemoryError|CUDA out of memory', log):
                         atomic_file(self.job / ('gpu-oom-' + item['name'] + '.log'), log)
                         if 'torch.OutOfMemoryError' in log and 'Traceback (most recent call last):' in log:
@@ -639,6 +696,12 @@ class Switch:
                 self.event("加载进度：" + "; ".join(str(x[1]) + "=" + str(x[2]) for x in brief), instances=brief)
                 last = brief
             errors = errors + 1 if any(i.get("state") == "error" for i in items) else 0
+            if errors and not rollback:
+                for item in items:
+                    if item.get('state') == 'error':
+                        log = self.host.container_logs(item['name'] + '-run-0', self.state['created_at'])
+                        if log:
+                            atomic_file(self.job / ('startup-' + item['name'] + '.log'), log)
             if errors >= 3:
                 raise SwitchError("模型实例持续报错，请查看本次加载记录。")
             if time.monotonic() >= notice:
@@ -791,15 +854,18 @@ class Switch:
         self.save(recovery_boot_id=current_boot, recovered_after_reboot=True)
         self.event("检测到整机重启，已记录本次启动后的服务身份，准备恢复未完成切换")
 
-    def publish_state(self):
+    def publish_state(self, only_profiles=False):
         """更新生产目录的导出，避免缓存重建后手工恢复文件仍引用已经删除的旧编号。"""
-        model = read_json(self.job / "verified-model.json")
+        # 尚未修改模型的取消路径没有新的验收文件，只需恢复静态方案导出。
+        # 保留原来的实际运行导出，不把一次排空取消写成新的功能验收。
+        model = read_json(self.job / ('model-before.json' if only_profiles else 'verified-model.json'))
         changed = {}
-        for name in ("pd-model-live.json", "pd-model-live.yaml"):
-            changed[name] = model
-        stopped = copy.deepcopy(model)
-        stopped["replicas"] = 0
-        changed["pd-model-stopped.yaml"] = stopped
+        if not only_profiles:
+            for name in ("pd-model-live.json", "pd-model-live.yaml"):
+                changed[name] = model
+            stopped = copy.deepcopy(model)
+            stopped["replicas"] = 0
+            changed["pd-model-stopped.yaml"] = stopped
         # 配比模板保持不绑定缓存；通用恢复模板才描述当前真实缓存编号。
         for mode, name in (("1p1d-no-cache", "pd-model-1p1d-stopped.yaml"),
                            ("2p2d-cache", "pd-model-2p2d-stopped.yaml"),
@@ -914,6 +980,7 @@ class Switch:
                     self.save("verifying")
                     self.verify(same)
                     self.publish_state()
+                    complete_prepared_release(self.host, True, self.job)
                     if self.state.get("gate_intent"):
                         self.restore_gate()
                     self.remember(True)
@@ -945,6 +1012,7 @@ class Switch:
             self.save("verifying")
             self.verify(model)
             self.publish_state()
+            complete_prepared_release(self.host, True, self.job)
             self.restore_gate()
             self.remember(True)
             self.save("committed", finished_at=stamp())
@@ -977,7 +1045,17 @@ class Switch:
                 if original.get("replicas"):
                     self.ready(original, rollback=True)
                     self.verify(original, rollback=True)
+                complete_prepared_release(self.host, False, self.job)
+                self.config = self.host.config
+                if original.get("replicas"):
                     self.publish_state()
+            # 排空超时等情形尚未修改模型，也应撤销预备文件，避免下次无意重试。
+            if not self.state.get('model_mutation_intent'):
+                complete_prepared_release(self.host, False, self.job)
+                self.config = self.host.config
+                # 即使因排空超时而未改模型，预备版本的静态导入文件也已更新过。
+                # 按仍在运行的原模型重新导出，使文件与恢复后的旧配方保持一致。
+                self.publish_state(only_profiles=True)
             if self.state.get("gate_intent"):
                 self.restore_gate()
             previous_state = read_json(self.job / 'manager-before.json')
@@ -1049,6 +1127,21 @@ def preflight(host, target, operation="switch"):
         replicas, tp = shape[name]
         if roles[name]["replicas"] != replicas or int(flags["--tensor-parallel-size"]) != tp:
             raise SwitchError("角色数或 TP 与方案不符。")
+        # 受限CPU亲和性的容器中，官方自动NUMA检测会返回空；必须在关入口前
+        # 拒绝缺少显式拓扑的绑定配置，而不是到引擎子进程创建时才失败。
+        if flags.get('--numa-bind') and '--numa-bind-nodes' not in flags:
+            raise SwitchError('NUMA绑定缺少显式节点列表，不能依赖受限容器中的自动检测：' + name)
+        # GPUStack原生选择器把未声明每副本卡数的gpu_ids视为实例的完整卡组。
+        # 多副本角色的列表是候选池，必须显式提供与TP一致的gpus_per_replica；
+        # 否则四张候选卡会被当成TP4，直到维护入口关闭后才在真实调度中失败。
+        selector = roles[name].get('gpu_selector') or {}
+        selected = selector.get('gpu_ids') or []
+        if selected:
+            per_replica = selector.get('gpus_per_replica') or len(selected)
+            if per_replica != tp:
+                raise SwitchError('角色候选卡池与每个副本的TP不一致，须显式设置gpus_per_replica：' + name)
+            if len(set(selected)) < replicas * tp:
+                raise SwitchError('角色候选卡池不足以给全部副本分配独立显卡：' + name)
         if flags.get("--speculative-config", {}).get("num_speculative_tokens") != 3 or flags.get("--default-chat-template-kwargs", {}).get("reasoning_effort") != "xhigh":
             raise SwitchError("MTP3 或默认 xhigh 配置不完整。")
     cache_path = host.root / "cache-service.json"
@@ -1125,6 +1218,11 @@ def preflight(host, target, operation="switch"):
 def prepare_job(host, args):
     """在任何模型修改之前冻结原配置，事务目录与快照均为 root 私有。"""
     initial = preflight(host, args.mode, getattr(args, 'operation', 'switch'))
+    # 首次应用预备版本必须排空，不能因调用者漏写选项而中断等待中的长请求。
+    prepared = prepared_release_module(host.root)
+    if prepared is not None and getattr(args, 'operation', 'switch') != 'stop':
+        if read_json(host.root / 'next-start-release.json').get('phase') == 'prepared':
+            args.require_drained = True
     parent = host.root / "baks/pd-switch"
     name = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
     job = parent / name
@@ -1132,6 +1230,7 @@ def prepare_job(host, args):
     state = {"id": name, "unit": "gpustack-pd-switch-" + name, "phase": "queued",
         "target": args.mode, "operation": getattr(args, 'operation', 'switch'), "with_cache": args.mode != "1p1d-no-cache", "cluster_id": initial["model"]["cluster_id"],
         "created_at": stamp(), "drain_timeout": args.drain_timeout, "restart": args.restart,
+        "require_drained": getattr(args, "require_drained", False),
         "extended_check": getattr(args, "extended_check", False),
         "health_only": getattr(args, "health_only", False),
         "gate_token": secrets.token_hex(24), "model_mutation_intent": False, "gate_intent": False,
@@ -1146,9 +1245,13 @@ def prepare_job(host, args):
     definition = read_json(host.root / "cache-service.json")
     definition["cluster_id"] = initial["model"]["cluster_id"]
     definition["worker_selector"] = initial["model"]["worker_selector"]
-    # CPU服务器也屏蔽最后两卡；不能只约束vLLM角色而遗漏共享缓存的CUDA上下文。
-    if args.mode == '1p2d-6gpu-cache':
-        definition['config']['env']['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, host.config['mode_gpu_ids'][args.mode]))
+    # CPU共享池只被P使用，其CUDA上下文和CPU亲和性只需覆盖本方案P的显卡。
+    # 卡号来自正式选择器，并检查属于本次授权集合，不能在这里写死某台机器的布局。
+    p_role = next(r for r in initial['profile']['roles'] if r['name'] == 'prefill')
+    p_gpus = {int(g.rsplit(':', 1)[1]) for g in p_role['gpu_selector']['gpu_ids']}
+    if not p_gpus or not p_gpus <= set(host.config['mode_gpu_ids'][args.mode]):
+        raise SwitchError('缓存的P显卡集合超出授权范围。')
+    definition['config']['env']['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, sorted(p_gpus)))
     write_json(job / "target-cache.json", definition)
     original_entry = (host.root / "entrypoint/nginx.conf").read_text()
     atomic_file(job / "nginx-before.conf", original_entry)
@@ -1161,6 +1264,9 @@ def prepare_job(host, args):
             raise SwitchError("必需服务没有运行：" + name)
     write_json(job / "protected-before.json", protected)
     write_json(parent / "LAST.json", {"id": job.name})
+    if getattr(args, 'operation', 'switch') != 'stop':
+        if prepared is not None:
+            prepared.bind(host.root, job.name)
     return job
 
 
@@ -1273,6 +1379,7 @@ def launch(root, args):
         except Exception:
             state.update(phase="aborted", error="未能创建后台执行单元，尚未修改入口或模型。")
             write_json(job / "state.json", state)
+            complete_prepared_release(host, False, job)
             raise
     print("后台任务：" + state["unit"] + "；关闭 SSH 不会中断。", flush=True)
     return 0 if args.no_wait else follow(job)
@@ -1288,6 +1395,7 @@ def main():
     parser.add_argument("--extended-check", action="store_true", help="在入口隔离期间增加上下文、并发和缓存回归；升级验收时使用")
     parser.add_argument("--health-only", action="store_true", help="仅检查全部成员、实际参数、入口及内存；不发送推理测试请求，不代表功能验收")
     parser.add_argument("--drain-timeout", type=int, default=120, help="最多等待在途请求结束的秒数，默认120")
+    parser.add_argument("--require-drained", action="store_true", help="排空超时取消切换并恢复入口，不中断剩余请求")
     parser.add_argument("--worker-job", help=argparse.SUPPRESS)
     parser.add_argument("--recover-job", help=argparse.SUPPRESS)
     parser.add_argument("--recover-pending", action="store_true", help=argparse.SUPPRESS)

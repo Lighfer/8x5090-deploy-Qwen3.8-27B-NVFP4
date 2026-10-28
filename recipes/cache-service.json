@@ -12,7 +12,8 @@
     "env": {
       "CUDA_VISIBLE_DEVICES": "@@CACHE_GPU_IDS@@",
       "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
-      "LMCACHE_LOG_LEVEL": "INFO"
+      "LMCACHE_LOG_LEVEL": "INFO",
+      "GPUSTACK_CACHE_CPU_AFFINITY": "auto"
     },
     "fields": {
       "ram_size": "@@CACHE_GIB@@",

@@ -12,7 +12,6 @@
     "--trust-remote-code",
     "--dtype=bfloat16",
     "--distributed-executor-backend=mp",
-    "--disable-custom-all-reduce",
     "--attention-backend=FLASHINFER",
     "--mamba-backend=triton",
     "--gdn-prefill-backend=flashinfer",
@@ -34,7 +33,7 @@
     "--mm-processor-cache-gb=0",
     "--speculative-config={\"method\":\"mtp\",\"num_speculative_tokens\":3,\"disable_eagle_block_drop\":true}",
     "--tensor-parallel-size=2",
-    "--gpu-memory-utilization=0.84",
+    "--gpu-memory-utilization=0.8714",
     "--max-num-batched-tokens=1536",
     "--max-num-seqs=12",
     "--block-size=1536",
@@ -64,8 +63,12 @@
     "VLLM_HTTP_TIMEOUT_KEEP_ALIVE": "120",
     "UCX_CUDA_IPC_ENABLE_GET_ZCOPY": "on",
     "NIXL_SHARE_WORKER_PID": "1",
-    "FLASHINFER_WORKSPACE_BASE": "/var/lib/gpustack/cache/v032-flashinfer",
-    "VLLM_SM12X_DRAFT_UB_PLAN": "0"
+    "FLASHINFER_WORKSPACE_BASE": "/var/lib/gpustack/cache/e4a5b5537-opt-20261028/flashinfer",
+    "VLLM_SM12X_DRAFT_UB_PLAN": "0",
+    "VLLM_LOG_STATS_INTERVAL": "3",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "CUTE_DSL_CACHE_DIR": "/var/lib/gpustack/cache/e4a5b5537-opt-20261028/cute",
+    "CUDA_CACHE_PATH": "/var/lib/gpustack/cache/e4a5b5537-opt-20261028/cuda"
   },
   "restart_on_error": false,
   "extended_kv_cache": {
@@ -79,7 +82,6 @@
         "--trust-remote-code",
         "--dtype=bfloat16",
         "--distributed-executor-backend=mp",
-        "--disable-custom-all-reduce",
         "--attention-backend=FLASHINFER",
         "--mamba-backend=triton",
         "--gdn-prefill-backend=flashinfer",
@@ -101,7 +103,7 @@
         "--mm-processor-cache-gb=0",
         "--speculative-config={\"method\":\"mtp\",\"num_speculative_tokens\":3,\"disable_eagle_block_drop\":true}",
         "--tensor-parallel-size=2",
-        "--gpu-memory-utilization=0.84",
+        "--gpu-memory-utilization=0.8714",
         "--max-num-batched-tokens=9216",
         "--max-num-seqs=6",
         "--block-size=1536",
@@ -109,13 +111,16 @@
         "--mm-processor-kwargs={\"images_kwargs\":{\"size\":{\"shortest_edge\":65536,\"longest_edge\":1048576}}}",
         "--mm-encoder-tp-mode=weights",
         "--mm-processor-device=cpu",
-        "--no-skip-mm-profiling"
+        "--no-skip-mm-profiling",
+        "--long-prefill-token-threshold=3072",
+        "--long-prefill-token-threshold-adaptive"
       ],
       "extended_kv_cache": {
         "enabled": false
       },
       "gpu_selector": {
-        "gpu_ids": "@@PREFILL_GPU_IDS@@"
+        "gpu_ids": "@@PREFILL_GPU_IDS@@",
+        "gpus_per_replica": 2
       }
     },
     {
@@ -125,7 +130,6 @@
         "--trust-remote-code",
         "--dtype=bfloat16",
         "--distributed-executor-backend=mp",
-        "--disable-custom-all-reduce",
         "--attention-backend=FLASHINFER",
         "--mamba-backend=triton",
         "--gdn-prefill-backend=flashinfer",
@@ -147,7 +151,7 @@
         "--mm-processor-cache-gb=0",
         "--speculative-config={\"method\":\"mtp\",\"num_speculative_tokens\":3,\"disable_eagle_block_drop\":true}",
         "--tensor-parallel-size=2",
-        "--gpu-memory-utilization=0.84",
+        "--gpu-memory-utilization=0.8714",
         "--max-num-batched-tokens=1536",
         "--max-num-seqs=12",
         "--block-size=1536",
@@ -161,7 +165,8 @@
         "enabled": false
       },
       "gpu_selector": {
-        "gpu_ids": "@@DECODE_GPU_IDS@@"
+        "gpu_ids": "@@DECODE_GPU_IDS@@",
+        "gpus_per_replica": 2
       }
     },
     {

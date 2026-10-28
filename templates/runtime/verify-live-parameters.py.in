@@ -44,8 +44,17 @@ export['cluster_name']=data['cluster_name']
 effective={role:role_effective_model(model,role).backend_parameters for role in ['prefill','decode']}
 effective_images={role:role_effective_model(model,role).image_name for role in ['prefill','decode']}
 replicas={role:role_effective_model(model,role).replicas for role in ['prefill','decode']}
+cache_ids=sorted({r.extended_kv_cache.cache_service_id for r in model.roles
+    if r.extended_kv_cache and r.extended_kv_cache.enabled and r.extended_kv_cache.cache_service_id})
+cache_services=[]
+if cache_ids:
+    # 沿用只读数据库连接，按模型实际引用的服务读取声明，不拿待应用文件冒充回滚状态。
+    cache_sql='SELECT COALESCE(json_agg(json_build_object(\'id\',id,\'config\',config)),\'[]\'::json) FROM cache_services WHERE id IN ('+','.join(str(int(i)) for i in cache_ids)+')'
+    cached=subprocess.run(['psql','-X','-h','127.0.0.1','-U','root','-d','gpustack','-At','-c',cache_sql],
+        env=env,capture_output=True,text=True,check=True,timeout=15)
+    cache_services=json.loads(cached.stdout)
 print(json.dumps(dict(model_export=export,effective=effective,effective_images=effective_images,expected_replicas=replicas,instances=data['instances'],
-    decode_override=next(r.backend_parameters for r in model.roles if r.name=='decode'))))
+    cache_services=cache_services,decode_override=next(r.backend_parameters for r in model.roles if r.name=='decode'))))
 '''
 
 
@@ -64,6 +73,19 @@ def options(arguments):
             except json.JSONDecodeError:assigned=json.loads(assigned.replace('\\"','"'))
         result[key]=assigned;index+=1
     return result
+
+
+def cache_gpu_scope(service, allowed_gpus, prefill_gpus):
+    """缓存必须精确遵守平台声明，并覆盖全部P，且不能看到本方案以外的预留卡。
+
+    旧版声明全部模型GPU，新版只声明P的GPU；二者都依据各自真实服务定义核验，
+    不能把D卡必须可见作为CPU共享缓存成立的条件，也不能接受任意非空子集。
+    """
+    raw=service['config']['env']['CUDA_VISIBLE_DEVICES']
+    values=[int(item.strip()) for item in raw.split(',') if item.strip()]
+    if not values or len(values)!=len(set(values)) or not set(prefill_gpus)<=set(values)<=set(allowed_gpus):
+        raise RuntimeError('缓存GPU声明未覆盖P、包含预留卡或存在重复')
+    return sorted(values)
 
 
 
@@ -182,9 +204,13 @@ def main():
         native_multi_router_mode='Multi-router mode enabled (enable_igw=true)' in logs)
     unique_gpus=len(assigned_gpus)==len(set(assigned_gpus)) and sorted(assigned_gpus)==expected_gpus
     cache_visibility_matches=True
+    expected_cache_gpus=[]
     shared=any((r.get('extended_kv_cache') or {}).get('enabled') for r in data['model_export']['roles'])
     if shared:
-        # 验证专用共享缓存也没有看到预留卡，防止六卡模型的旁路进程占用6、7号卡。
+        # 对照模型实际引用服务的声明，而非要求CPU池额外看到D的显卡。
+        prefill_gpus={g for item in checks if item['role']=='prefill' for g in item['gpu_indexes']}
+        if len(data['cache_services'])!=1:raise RuntimeError('共享缓存声明必须唯一')
+        expected_cache_gpus=cache_gpu_scope(data['cache_services'][0],expected_gpus,prefill_gpus)
         cache_name=json.loads((Path(__file__).parent/'switch-config.json').read_text())['cache_name']
         names=subprocess.check_output(['docker','ps','--format','{{.Names}}'],text=True).splitlines()
         names=[n for n in names if n.startswith(cache_name+'-server-') and n.endswith('-run-0')]
@@ -192,8 +218,8 @@ def main():
         if names:
             cache_inspect=json.loads(subprocess.check_output(['docker','inspect',names[0]],text=True))[0]
             cache_env=dict(e.split('=',1) for e in cache_inspect['Config']['Env'])
-            cache_visibility_matches=cache_visibility_matches and sorted(int(x) for x in cache_env.get('CUDA_VISIBLE_DEVICES','').split(',') if x)==expected_gpus
-    report=dict(at=datetime.datetime.now(datetime.timezone.utc).isoformat(),gpu_assignment_complete_and_disjoint=unique_gpus,expected_gpu_indexes=expected_gpus,cache_gpu_visibility_matches=cache_visibility_matches,
+            cache_visibility_matches=cache_visibility_matches and sorted(int(x) for x in cache_env.get('CUDA_VISIBLE_DEVICES','').split(',') if x)==expected_cache_gpus
+    report=dict(at=datetime.datetime.now(datetime.timezone.utc).isoformat(),gpu_assignment_complete_and_disjoint=unique_gpus,expected_gpu_indexes=expected_gpus,cache_gpu_visibility_matches=cache_visibility_matches,expected_cache_gpu_indexes=expected_cache_gpus,
         passed=all(c['all_declared_parameters_present'] and c['gpu_count_matches'] and c['mtp_enabled'] and c['connectors_match'] and c['image_matches'] and c['nixl_namespace_matches'] and c['environment_matches'] for c in checks)
             and unique_gpus and cache_visibility_matches and router['dedicated_image_matches'] and router['native_multi_router_mode']
             and router['stage_policies_match'] and router['explicit_parameters_match'],

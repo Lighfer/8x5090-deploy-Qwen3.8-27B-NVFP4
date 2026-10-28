@@ -25,6 +25,7 @@ def main():
     parser.add_argument('--work', required=True, help='仓库外、尚不存在的核验目录')
     parser.add_argument('--router-archive', help='可选的仓库外公开源码包；未提供时按固定来源下载')
     parser.add_argument('--base-source', help='可选的仓库外基础源码目录，包含base_scheduler.py、page.py及page.cuh')
+    parser.add_argument('--optimization-source', help='可选的仓库外原始软件目录，包含优化清单登记的vllm与flashinfer文件')
     args = parser.parse_args()
     work = outside_repository(args.work, may_exist=False)
     work.mkdir(parents=True)
@@ -93,6 +94,24 @@ def main():
         (work / 'flashinfer-output.txt').write_text(result.stdout, encoding='utf-8')
         rows.append({'check': 'flashinfer-official-diff-and-kernel-guards', 'passed':
                      digest(work / 'page-patched.py') == read_json(ROOT / 'STACK.json')['flashinfer6204']['page_patched_sha256']})
+    if args.optimization_source:
+        base = outside_repository(args.optimization_source)
+        destination = work / 'optimization-source'
+        manifest = read_json(ROOT / 'sources/vllm/optimizations/manifest.json')
+        for name in manifest['original_files']:
+            source, target = safe_path(base, name), safe_path(destination, name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        result = run(ROOT / 'sources/vllm/optimizations/apply-patches.py', '--root', destination, '--execute')
+        (work / 'optimization-output.txt').write_text(result.stdout, encoding='utf-8')
+        if any(digest(safe_path(destination, name)) != checksum for name, checksum in manifest['final_files'].items()):
+            raise ValueError('候选优化重放末态不符')
+        # 第二次执行必须确认幂等，不得在已经修正的源码上继续叠加差异。
+        second = run(ROOT / 'sources/vllm/optimizations/apply-patches.py', '--root', destination, '--execute')
+        if not json.loads(second.stdout)['already_applied']:
+            raise ValueError('候选优化重放不是幂等操作')
+        rows.append({'check': 'optimization-patches-and-idempotence', 'passed': True,
+                     'patches': len(manifest['patches']), 'files': len(manifest['final_files'])})
     report = {'passed': all(row['passed'] for row in rows), 'checks': rows,
               'gpu_inference_performed': False, 'base_source_checked': bool(args.base_source)}
     output_json(work / 'summary.json', report)

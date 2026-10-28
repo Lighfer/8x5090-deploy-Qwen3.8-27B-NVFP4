@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""协调预备升级、失败文件恢复和下次开机应用；不直接修改模型数据库。"""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path, PurePosixPath
+import subprocess
+import tempfile
+import time
+
+
+def read(path):
+    """所有状态均在私有部署目录；公开仓库不携带目标环境数据。"""
+    return json.loads(Path(path).read_text())
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def atomic(path, data, mode=0o600):
+    """同目录写入并替换；防止中断留下半个JSON或配置文件。"""
+    path = Path(path)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.chmod(mode)
+    temporary.replace(path)
+
+
+def save(path, value):
+    atomic(path, (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode())
+
+
+def safe(root, relative):
+    """拒绝绝对路径、跳出目录和符号链接，恢复不能碰到仓库外的任意文件。"""
+    name = PurePosixPath(relative)
+    if name.is_absolute() or not name.parts or '..' in name.parts:
+        raise RuntimeError('恢复文件路径不合法')
+    root = Path(root).resolve()
+    target = root.joinpath(*name.parts)
+    if any(p.is_symlink() for p in [target, *target.parents] if p != root and root in p.parents):
+        raise RuntimeError('恢复路径不能经过符号链接')
+    if not target.resolve().is_relative_to(root):
+        raise RuntimeError('恢复路径越界')
+    return target
+
+
+def validated_files(root, plan, allow_old=False):
+    """先检查全部新文件和备份，再开始恢复；部分恢复后的重试也能继续。"""
+    values = []
+    for relative, item in plan['files'].items():
+        path, backup = safe(root, relative), safe(root, item['backup'])
+        if not item['backup'].startswith('baks/'):
+            raise RuntimeError('恢复来源必须为私有备份目录')
+        data = backup.read_bytes()
+        if digest(data) != item['before_sha256']:
+            raise RuntimeError('旧配置备份身份不符：' + relative)
+        accepted = {item['after_sha256']}
+        if allow_old:
+            accepted.add(item['before_sha256'])
+        if digest(path.read_bytes()) not in accepted:
+            raise RuntimeError('文件被其他维护修改，拒绝覆盖：' + relative)
+        values.append((path, data, item.get('mode', 0o600)))
+    return values
+
+
+def bind(root, job_id):
+    """只有待应用记录才绑定首次启动事务；已应用版本不参与以后普通切换的回滚。"""
+    marker = Path(root) / 'next-start-release.json'
+    plan = read(marker)
+    if plan['phase'] != 'prepared':
+        return
+    validated_files(root, plan)
+    plan.update(phase='activating', activation_job=job_id)
+    save(marker, plan)
+
+
+def complete(root, successful, job_id):
+    """绑定的升级失败时恢复旧配方；外部修改则拒绝覆盖并保留入口维护。"""
+    marker = Path(root) / 'next-start-release.json'
+    plan = read(marker)
+    if plan.get('activation_job') != job_id or plan['phase'] not in ('activating', 'applied', 'restoring'):
+        return
+    if successful:
+        validated_files(root, plan)
+        plan['phase'] = 'applied'
+        save(marker, plan)
+        return
+    values = validated_files(root, plan, allow_old=True)
+    plan['phase'] = 'restoring'
+    save(marker, plan)
+    for path, data, mode in values:
+        atomic(path, data, mode)
+    # 私有目录可能另有文件校验表。只刷新本次恢复的登记项，其他条目继续保留；
+    # 运行导出文件由正式切换执行器随后按原模型重新生成和登记。
+    sums = Path(root) / 'SHA256SUMS'
+    if sums.exists():
+        lines = []
+        for line in sums.read_text().splitlines():
+            checksum, separator, name = line.partition('  ')
+            if separator and name in plan['files']:
+                line = digest(safe(root, name).read_bytes()) + '  ' + name
+            lines.append(line)
+        atomic(sums, ('\n'.join(lines) + '\n').encode(), 0o644)
+    plan['phase'] = 'failed-restored'
+    save(marker, plan)
+
+
+def boot_should_apply(root, current_boot):
+    """保留人工停机意图；同次开机准备的版本不会在后台自行启动。"""
+    root = Path(root)
+    plan = read(root / 'next-start-release.json')
+    if plan['phase'] != 'prepared' or plan['prepared_boot_id'] == current_boot:
+        return False
+    manager = read(root / 'model-state.json') if (root / 'model-state.json').exists() else {}
+    return manager.get('running') is True
+
+
+def boot_transition(current, instances, has_model_process):
+    """按实际容器决定是否可接管；数据库残留实例不能当成仍在服务的进程。"""
+    if not has_model_process:
+        return 'empty'
+    expected = sum(r['replicas'] for r in current['roles'])
+    if current.get('replicas') and len(instances) == expected and all(i['state'] == 'running' for i in instances):
+        return 'ready'
+    return 'wait'
+
+
+def apply_at_boot(root):
+    """开机后复用正式切换流程；不新增模型、不绕过GPUStack、不直接放行入口。"""
+    current_boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    if not boot_should_apply(root, current_boot):
+        print('没有需要开机应用的预备版本，或模型已被人工停止。', flush=True)
+        return 0
+    plan = read(root / 'next-start-release.json')
+    validated_files(root, plan)
+    spec = importlib.util.spec_from_file_location('gpustack_next_start_switch', root / 'switch-pd.py')
+    switch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(switch)
+    # Docker启动与控制服务就绪不同步。存在旧模型进程时等待它可排空；完全没有
+    # 进程时允许正式脚本接管过期实例记录，不要求先把旧模型加载一遍。
+    deadline = time.monotonic() + 1500
+    while True:
+        try:
+            host = switch.Host(root)
+            manager = read(root / 'model-state.json')
+            if manager.get('running') is not True:
+                return 0
+            mode = manager['last_mode']
+            switch.preflight(host, mode, 'start')
+            current = host.call('GET', '/v2/models/' + str(host.config['model_id']))
+            instances = host.call('GET', '/v2/models/' + str(host.config['model_id']) + '/instances')['items']
+            processes = any(switch.owns_model_container(host.config, c) for c in host.containers())
+            if boot_transition(current, instances, processes) == 'wait':
+                raise RuntimeError('原部署仍在恢复')
+            break
+        except Exception as error:
+            if time.monotonic() >= deadline:
+                raise RuntimeError('原服务未就绪；预备版本未自动强制切换') from error
+            time.sleep(5)
+    return subprocess.run(['/usr/bin/python3', str(root / 'switch-pd.py'), 'start',
+                           '--require-drained', '--drain-timeout', '600']).returncode
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--boot', action='store_true', required=True)
+    parser.parse_args()
+    raise SystemExit(apply_at_boot(Path(__file__).resolve().parent))

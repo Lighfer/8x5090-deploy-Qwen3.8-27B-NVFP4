@@ -33,7 +33,8 @@
   },
   "gpus": {
     "eight_card_order": null,
-    "six_card_order": null
+    "six_card_order": null,
+    "numa_nodes": null
   },
   "resources": {
     "cache_gib": null,

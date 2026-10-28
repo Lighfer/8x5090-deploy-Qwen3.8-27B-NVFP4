@@ -5,6 +5,13 @@
   "torch": "2.14.0+cu130",
   "flashinfer": "0.7.2.post1",
   "lmcache": "0.5.6",
+  "lmcache_cuda_rebuild": {
+    "components": ["lmcache.cuda_ops", "lmcache.lmcache_native"],
+    "source_sha256": "d6951e60ce8818a76aa42d0866a4ba85f1c95cd919355fff30ff24dcc3243f1e",
+    "torch": "2.14.0+cu130",
+    "architecture": "12.0",
+    "reason": "官方0.5.6轮子使用Torch 2.13；重建CUDA扩展以匹配当前Torch ABI，不改变Python包版本"
+  },
   "nixl": "1.5.0",
   "transformers": "5.20.2",
   "original_nixl_sha256": "07b53d62e69f3eac36217e19df9dc7420618e713b5f47bed9a07ff45e6f60262",
@@ -30,5 +37,24 @@
   },
   "gpustack": "2.3.0",
   "gpustack_runtime": "0.2.6",
-  "router": "0.1.16"
+  "router": "0.1.16",
+  "optimization_release": {
+    "name": "e4a5b5537-opt-20261028",
+    "vllm_audit_head": "eaf1627c01f553ea9a26b3d77f3cff8495dbf404",
+    "manifest": "sources/vllm/optimizations/manifest.json",
+    "vllm_backports": [
+      58243,
+      57368,
+      57926,
+      63633,
+      63154,
+      55112,
+      63785,
+      53104
+    ],
+    "flashinfer_backports": [
+      6371
+    ],
+    "gpu_performance_verified": false
+  }
 }

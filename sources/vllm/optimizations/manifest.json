@@ -1,0 +1,193 @@
+{
+  "format": 1,
+  "release": "e4a5b5537-opt-20261028",
+  "base_commit": "e4a5b5537344b103ed10de7764378ef09604ef3d",
+  "flashinfer_base_commit": "beabf5004585b03da60e927bbb803acbaa62fe36",
+  "patches": [
+    {
+      "project": "vllm",
+      "pr": 58243,
+      "commit": "7128f568ac036f7b7f21860d1928747ac6f78213",
+      "url": "https://github.com/vllm-project/vllm/commit/7128f568ac036f7b7f21860d1928747ac6f78213",
+      "file": "patches/vllm-58243-7128f568ac03.patch",
+      "sha256": "438495f437b0a713e6f94ca18c60bc5410334b40001e2e4bb45467a14eebed85",
+      "before": {
+        "vllm/v1/worker/gpu/cudagraph_utils.py": "739f6de7cb46bb3bf1d535376915c5a8d0fcb2aedaf0c39d56669838164331c9",
+        "vllm/v1/worker/gpu_worker.py": "ccba545c1883c723836fbfeac3babee57e502a46cd3dabfe94a46852500e6140"
+      },
+      "after": {
+        "vllm/v1/worker/gpu/cudagraph_utils.py": "1ff1655db4ca85ad2efcd8de9b3de37f053eb68d1d22202d45301c11866b0d40",
+        "vllm/v1/worker/gpu_worker.py": "e46a2659842b5b0238ca5d13ecb4a2dcff91f028493a7117d666edb0785a742c"
+      },
+      "context_adaptation": null
+    },
+    {
+      "project": "vllm",
+      "pr": 57368,
+      "commit": "373614f66dc8dc678faaf33223256f814238b7cb",
+      "url": "https://github.com/vllm-project/vllm/commit/373614f66dc8dc678faaf33223256f814238b7cb",
+      "file": "patches/vllm-57368-373614f66dc8.patch",
+      "sha256": "a03cf72849e870aabbb990c927e249d2a1ad19d74d54ecf863cb9b77acb9a96e",
+      "before": {
+        "vllm/v1/core/sched/output.py": "10954c55eada8a24f0612ed4a7ff7d0a72d26b20776353e4dab43560797b51c3",
+        "vllm/v1/core/sched/scheduler.py": "2aab08cb511d5905c280697fcc47fffa60804759d6fba22496779892c290b41b",
+        "vllm/v1/worker/gpu/mm/encoder_cache.py": "a27a52c2c52686a574b24910d38f7bd81508fa75d9d757f1b8d6e169575aa385",
+        "vllm/v1/worker/gpu/model_runner.py": "49a6f9c289c91de31837bfd1fa03d7f82c341b18dc30bd9b693c963c5805e074"
+      },
+      "after": {
+        "vllm/v1/core/sched/output.py": "f2d5b52a3869472c3c66d31bb0960e9a328d59e7271bc1e2c9d7f3ba72d8c62a",
+        "vllm/v1/core/sched/scheduler.py": "06b9d50b20888a90fcef0e516565807a1731a62bddbedbffd38584e003be4b09",
+        "vllm/v1/worker/gpu/mm/encoder_cache.py": "191e1f5e33a066b0692ed132774c37a99108477a7ac25f3addc47efe763c1c9a",
+        "vllm/v1/worker/gpu/model_runner.py": "198d8cc618b83680fbdc7c1c3ae5e3fc2fbb28b32f29079bd575b6547fa0e575"
+      },
+      "context_adaptation": {
+        "upstream_file": "patches/vllm-57368-373614f66dc8.patch.upstream",
+        "upstream_sha256": "ba2046baf2c1ff3db4fbe81d7eba4d928bf44d84a191073f1430bc1bdc2b5044",
+        "reason": "仅适配基线异步占位逻辑所在位置，不更改新增方法或占位更新语义"
+      }
+    },
+    {
+      "project": "vllm",
+      "pr": 57926,
+      "commit": "7f56f453ede3fabd7311dcb6099ca6b6d8c49770",
+      "url": "https://github.com/vllm-project/vllm/commit/7f56f453ede3fabd7311dcb6099ca6b6d8c49770",
+      "file": "patches/vllm-57926-7f56f453ede3.patch",
+      "sha256": "1eee05c2bc956e5c71a0a87b9319047d66d49c6fb55676bc9fd2284d81334493",
+      "before": {
+        "vllm/v1/worker/gpu/model_runner.py": "198d8cc618b83680fbdc7c1c3ae5e3fc2fbb28b32f29079bd575b6547fa0e575"
+      },
+      "after": {
+        "vllm/v1/worker/gpu/model_runner.py": "347606a8a19c00b39032aba3c92adc758aed8958de3242419aa23fb95906c3ff"
+      },
+      "context_adaptation": null
+    },
+    {
+      "project": "flashinfer",
+      "pr": 6371,
+      "commit": "801fcd0a52ccf40bd28d15de25eda663887d5a58",
+      "url": "https://github.com/flashinfer-ai/flashinfer/commit/801fcd0a52ccf40bd28d15de25eda663887d5a58",
+      "file": "patches/flashinfer-6371-801fcd0a52cc.patch",
+      "sha256": "2d8208bbc02ed1ea8fec7f15138356dca9ce71e3c3c8088edb4ca5feeeeff419",
+      "before": {
+        "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py": "94fad8696bed061c577603f82670f038f55497231a6775717f8bef65facddb51"
+      },
+      "after": {
+        "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py": "c94c70ff2ea049c087173462e86a5c4155b0bde8882b17b23c9bc0dffa45e1e6"
+      },
+      "context_adaptation": null
+    },
+    {
+      "project": "vllm",
+      "pr": 63633,
+      "commit": "78e2f796019384b07c9f9b6d8a371e3ea958b33a",
+      "url": "https://github.com/vllm-project/vllm/commit/78e2f796019384b07c9f9b6d8a371e3ea958b33a",
+      "file": "patches/vllm-63633-78e2f7960193.patch",
+      "sha256": "b7ae53703a8a5d8e8d96698b19bcc8a5e382e17e29ccf1cf7e0a62fd17c1a3ab",
+      "before": {
+        "vllm/utils/torch_utils.py": "019077728fcf8ab898bd665c2260ffda6a7c8882319ebe0568ed05304cb14a7b",
+        "vllm/v1/worker/gpu/buffer_utils.py": "e8789b87f4185c0805bd8e2a39b50581e882102bc852ab7e6e1963af7115a475",
+        "vllm/v1/worker/gpu/mm/rope.py": "0924375bcb367267e783b57dd2ad9de1189d97025ce4313baaa54f2911eaaf1e"
+      },
+      "after": {
+        "vllm/utils/torch_utils.py": "af0563e2914a428367588dede5c45e2e493131d6b8f1440c0145fb7f67850ed5",
+        "vllm/v1/worker/gpu/buffer_utils.py": "a7fc781afffec1e85b277f567c00a8cabc7f3240410155bc46b77f581e101b47",
+        "vllm/v1/worker/gpu/mm/rope.py": "6e085037a1aab2dde93ac4e5997ee7c74ff8557570f9b90875721127ccd2d544"
+      },
+      "context_adaptation": {
+        "upstream_file": "patches/vllm-63633-78e2f7960193.patch.upstream",
+        "upstream_sha256": "84f121f291989e0f020e1fc03c075350accc3ad7a6d65b4afcfdeadf0e846173",
+        "reason": "仅保留基线仍需要的importlib.metadata导入上下文，优化主体不变"
+      }
+    },
+    {
+      "project": "vllm",
+      "pr": 63154,
+      "commit": "5b7742a13f7a53a42f4d14c2b843f166f02dac57",
+      "url": "https://github.com/vllm-project/vllm/commit/5b7742a13f7a53a42f4d14c2b843f166f02dac57",
+      "file": "patches/vllm-63154-5b7742a13f7a.patch",
+      "sha256": "152360c936abf6dc9634250bcaeb2bd665f0a815a88c89858154efbfb6e3826e",
+      "before": {
+        "vllm/v1/worker/gpu/model_runner.py": "347606a8a19c00b39032aba3c92adc758aed8958de3242419aa23fb95906c3ff"
+      },
+      "after": {
+        "vllm/v1/worker/gpu/model_runner.py": "da3bfae2c3d1ff47bc8337a5c946726ec26686447f242228a9728382a1557dd5"
+      },
+      "context_adaptation": null
+    },
+    {
+      "project": "vllm",
+      "pr": 55112,
+      "commit": "8701c9b7513db7f8ae1020c8d79efa8687120b5d",
+      "url": "https://github.com/vllm-project/vllm/commit/8701c9b7513db7f8ae1020c8d79efa8687120b5d",
+      "file": "patches/vllm-55112-8701c9b7513d.patch",
+      "sha256": "0116c23f699bb008bab6c705102b4161d9e1419fd000f2999efa7785e56be5eb",
+      "before": {
+        "vllm/v1/worker/utils.py": "85b23497017e5db07ea8f3fa56807c44dd7dd269f1977031bd86acdadfb0b5ec"
+      },
+      "after": {
+        "vllm/v1/worker/utils.py": "63da0e6e89099237d34698650d16652b2d3be776b765010e78b910fc733a089c"
+      },
+      "context_adaptation": null
+    },
+    {
+      "project": "vllm",
+      "pr": 63785,
+      "commit": "939ff73503a47c7acae280f095b7f16fb7fcf5fa",
+      "url": "https://github.com/vllm-project/vllm/commit/939ff73503a47c7acae280f095b7f16fb7fcf5fa",
+      "file": "patches/vllm-63785-939ff73503a4.patch",
+      "sha256": "db791608267e49833ad997a065316c0cdb6fd0082d1cd366752a04a4492acf14",
+      "before": {
+        "vllm/model_executor/parameter.py": "1a4bbd7400fd1ba79e8e1e8d19666cd22881ec83c35e6e01b3fdc78faee23171"
+      },
+      "after": {
+        "vllm/model_executor/parameter.py": "1a5e4f3adcb4e47f03e684a39f110567b945306f0ec658593cade69fcf7a1e17"
+      },
+      "context_adaptation": null
+    },
+    {
+      "project": "vllm",
+      "pr": 53104,
+      "commit": "43111fd1f0c3135ff671e25e2e85238aa05743d0",
+      "url": "https://github.com/vllm-project/vllm/commit/43111fd1f0c3135ff671e25e2e85238aa05743d0",
+      "file": "patches/vllm-53104-43111fd1f0c3.patch",
+      "sha256": "2babbb80a7b81ae7926423d5078107caeb628639813b2116ab89ce6c3c5faa29",
+      "before": {
+        "vllm/v1/worker/gpu/spec_decode/eagle/utils.py": "15c4ee896051b5995d19af8f8f00834692e0afb5caa84daef283c6ada7d1ca92"
+      },
+      "after": {
+        "vllm/v1/worker/gpu/spec_decode/eagle/utils.py": "18046f2303263a36df1f27519c53f9f8e5bf15ce4cbc8f1e5236a2d8947e26c4"
+      },
+      "context_adaptation": null
+    }
+  ],
+  "original_files": {
+    "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py": "94fad8696bed061c577603f82670f038f55497231a6775717f8bef65facddb51",
+    "vllm/model_executor/parameter.py": "1a4bbd7400fd1ba79e8e1e8d19666cd22881ec83c35e6e01b3fdc78faee23171",
+    "vllm/utils/torch_utils.py": "019077728fcf8ab898bd665c2260ffda6a7c8882319ebe0568ed05304cb14a7b",
+    "vllm/v1/core/sched/output.py": "10954c55eada8a24f0612ed4a7ff7d0a72d26b20776353e4dab43560797b51c3",
+    "vllm/v1/core/sched/scheduler.py": "2aab08cb511d5905c280697fcc47fffa60804759d6fba22496779892c290b41b",
+    "vllm/v1/worker/gpu/buffer_utils.py": "e8789b87f4185c0805bd8e2a39b50581e882102bc852ab7e6e1963af7115a475",
+    "vllm/v1/worker/gpu/cudagraph_utils.py": "739f6de7cb46bb3bf1d535376915c5a8d0fcb2aedaf0c39d56669838164331c9",
+    "vllm/v1/worker/gpu/mm/encoder_cache.py": "a27a52c2c52686a574b24910d38f7bd81508fa75d9d757f1b8d6e169575aa385",
+    "vllm/v1/worker/gpu/mm/rope.py": "0924375bcb367267e783b57dd2ad9de1189d97025ce4313baaa54f2911eaaf1e",
+    "vllm/v1/worker/gpu/model_runner.py": "49a6f9c289c91de31837bfd1fa03d7f82c341b18dc30bd9b693c963c5805e074",
+    "vllm/v1/worker/gpu/spec_decode/eagle/utils.py": "15c4ee896051b5995d19af8f8f00834692e0afb5caa84daef283c6ada7d1ca92",
+    "vllm/v1/worker/gpu_worker.py": "ccba545c1883c723836fbfeac3babee57e502a46cd3dabfe94a46852500e6140",
+    "vllm/v1/worker/utils.py": "85b23497017e5db07ea8f3fa56807c44dd7dd269f1977031bd86acdadfb0b5ec"
+  },
+  "final_files": {
+    "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py": "c94c70ff2ea049c087173462e86a5c4155b0bde8882b17b23c9bc0dffa45e1e6",
+    "vllm/model_executor/parameter.py": "1a5e4f3adcb4e47f03e684a39f110567b945306f0ec658593cade69fcf7a1e17",
+    "vllm/utils/torch_utils.py": "af0563e2914a428367588dede5c45e2e493131d6b8f1440c0145fb7f67850ed5",
+    "vllm/v1/core/sched/output.py": "f2d5b52a3869472c3c66d31bb0960e9a328d59e7271bc1e2c9d7f3ba72d8c62a",
+    "vllm/v1/core/sched/scheduler.py": "06b9d50b20888a90fcef0e516565807a1731a62bddbedbffd38584e003be4b09",
+    "vllm/v1/worker/gpu/buffer_utils.py": "a7fc781afffec1e85b277f567c00a8cabc7f3240410155bc46b77f581e101b47",
+    "vllm/v1/worker/gpu/cudagraph_utils.py": "1ff1655db4ca85ad2efcd8de9b3de37f053eb68d1d22202d45301c11866b0d40",
+    "vllm/v1/worker/gpu/mm/encoder_cache.py": "191e1f5e33a066b0692ed132774c37a99108477a7ac25f3addc47efe763c1c9a",
+    "vllm/v1/worker/gpu/mm/rope.py": "6e085037a1aab2dde93ac4e5997ee7c74ff8557570f9b90875721127ccd2d544",
+    "vllm/v1/worker/gpu/model_runner.py": "da3bfae2c3d1ff47bc8337a5c946726ec26686447f242228a9728382a1557dd5",
+    "vllm/v1/worker/gpu/spec_decode/eagle/utils.py": "18046f2303263a36df1f27519c53f9f8e5bf15ce4cbc8f1e5236a2d8947e26c4",
+    "vllm/v1/worker/gpu_worker.py": "e46a2659842b5b0238ca5d13ecb4a2dcff91f028493a7117d666edb0785a742c",
+    "vllm/v1/worker/utils.py": "63da0e6e89099237d34698650d16652b2d3be776b765010e78b910fc733a089c"
+  }
+}

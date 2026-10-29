@@ -13,8 +13,8 @@
     },
     {
       "path": "AGENTS.md",
-      "bytes": 9045,
-      "sha256": "f95768a287727bea97df7f172565a3889ae3770b41595c1f7a86b0b7c5029d3f"
+      "bytes": 10695,
+      "sha256": "3db19cc5bca0bb5be64e3e1d85b877b7b10e59e38b1446b661de67d1086fd263"
     },
     {
       "path": "LICENSE",
@@ -23,48 +23,48 @@
     },
     {
       "path": "NOTICE.md",
-      "bytes": 2673,
-      "sha256": "17374e00516ed845d7e1c09dae770e16f87d72eb4207d3d38e20af84258c4b2e"
+      "bytes": 3081,
+      "sha256": "23e2a7712c1ec8aa159d380e59592e5d1126d1cb253dd54526ccda9030e85dc0"
     },
     {
       "path": "README.md",
-      "bytes": 6078,
-      "sha256": "6f9fd95dbf23677429efb23bd3e80eda7e3119798ed433ba70312ba42ff274a0"
+      "bytes": 7331,
+      "sha256": "a0e350d2ad965ace50593e7eff2786e0bcdf2b6eba3741b32e1c696b8e8fbf33"
     },
     {
       "path": "STACK.json",
-      "bytes": 2158,
-      "sha256": "93887489823f53469fa61b998b0c5b2388e4b9fd473c343a9d924afa672627d2"
+      "bytes": 3457,
+      "sha256": "2c2c55353400d4334d16f3787834b0a84eaf2d469a0f22641b75deea95677ec1"
     },
     {
       "path": "config/site.example.json",
-      "bytes": 990,
-      "sha256": "909d5ad2728fac4623b8859c660033fda25f59b82aad294009e39e2e4cd37e7b"
+      "bytes": 1023,
+      "sha256": "2f5e3c66f86f838818fec0f20dd5872ed7393c839948865710865921402112a6"
     },
     {
       "path": "docs/01-环境与边界.md",
-      "bytes": 4096,
-      "sha256": "5651c399fddba0a9b698cd5cedde9b68133d5495a5d99f5991456e86a159197d"
+      "bytes": 4150,
+      "sha256": "27fa5b3432109dbe2590e0d5af8608fcc4e43a2a0ffdcadb504f28c4ebd89294"
     },
     {
       "path": "docs/02-从零部署.md",
-      "bytes": 6861,
-      "sha256": "101a6dd3c4de4eec54ea46218278d0e283daf1a9517adcefaa823de05bafbfc9"
+      "bytes": 7480,
+      "sha256": "b398763cd3ef87df425e6b70d3b687b290c700d01d6d0461e00583c091168a85"
     },
     {
       "path": "docs/03-方案与启停.md",
-      "bytes": 7096,
-      "sha256": "68415e0f4f417dde96c56a54cd64ae4d238b72c68bdb996d49beb72880619901"
+      "bytes": 7830,
+      "sha256": "3c29cf52bc32ed6f9f034ce6a1dc7ba44b16d5f88cd501b0511110080b871fae"
     },
     {
       "path": "docs/04-补丁与构建.md",
-      "bytes": 8099,
-      "sha256": "7951f7ee28e419d86d8335c41edc742d22fa93b14bdc2ccefddac5193fa1937f"
+      "bytes": 9126,
+      "sha256": "1fbcee92cf91e521fa4546fa39d1d2dee4e96a57ba90fe3e356fe8757334a7ac"
     },
     {
       "path": "docs/05-性能与缓存.md",
-      "bytes": 5706,
-      "sha256": "26877ed3236c93764200ec956d8d19bda4f446217d101306763d6560722fd16c"
+      "bytes": 5781,
+      "sha256": "cf06f35ad7cd997a631ee4b9aa1c9419ed6ac30fb76d3e72122b205b7994b435"
     },
     {
       "path": "docs/06-升级恢复与排障.md",
@@ -78,8 +78,28 @@
     },
     {
       "path": "docs/08-候选优化与下次启动.md",
-      "bytes": 13348,
-      "sha256": "a0c0ce17a670e2f7e0ef0162fef84b9aa8d99043fef3d342c3948c7d77b5ab9f"
+      "bytes": 13583,
+      "sha256": "5013e0b9df36cfcafafe31b71a3286fd45f9e8ed1367e6369b1418b1770bbb1f"
+    },
+    {
+      "path": "docs/09-缓存结果推进与分段.md",
+      "bytes": 5707,
+      "sha256": "9f552e93eaa2e4fdf50bc0ec08fa42b9087f8d7cfbaab7016d97d42060bd0210"
+    },
+    {
+      "path": "docs/10-FP8独立部署方案.md",
+      "bytes": 7981,
+      "sha256": "3d69709b598a7bcd3e12520b2e27b96470cd4c375790590ba9086da9fb340e1b"
+    },
+    {
+      "path": "docs/11-FP8校准与布局核验.md",
+      "bytes": 8730,
+      "sha256": "99db57a549b098b000e938af102c584e5b5aa79c513373c2b00077916dd876d1"
+    },
+    {
+      "path": "locks/model-downloads-fp8.json",
+      "bytes": 27669,
+      "sha256": "fddb3820e9f7eab2a2c67a9246e9d8a7e036c94662c37b69912d992c75ea0118"
     },
     {
       "path": "locks/model-downloads.json",
@@ -97,24 +117,29 @@
       "sha256": "2effdb9948b67e9d55f0455bd7088de6cb753df08da990350b4d7c41eedc8dad"
     },
     {
+      "path": "recipes/1p1d-cache-fp8.json",
+      "bytes": 7333,
+      "sha256": "b5eae84be79d002dffd186760612ec3201cf6725381c91e723afcd19491e2f5f"
+    },
+    {
       "path": "recipes/1p1d-cache.json",
       "bytes": 7300,
-      "sha256": "db5c3b09400375ab2623aaa7fc2808ba88ce0295e11cc34334eeda79c9fa85f5"
+      "sha256": "458fbec829cfb24dbfdce8a368b5ea943cb13f3e8a50d99f0c97dffc01aec7c1"
     },
     {
       "path": "recipes/1p1d-no-cache.json",
       "bytes": 7300,
-      "sha256": "db5c3b09400375ab2623aaa7fc2808ba88ce0295e11cc34334eeda79c9fa85f5"
+      "sha256": "458fbec829cfb24dbfdce8a368b5ea943cb13f3e8a50d99f0c97dffc01aec7c1"
     },
     {
       "path": "recipes/1p2d-6gpu-cache.json",
-      "bytes": 7082,
-      "sha256": "2d9489b3c452efd7bc7e225f08fc79d3cba479e21e558e26dc0db73d91c0ccbf"
+      "bytes": 7182,
+      "sha256": "17da1dcf725bc2544687d254d5acb5891e9e4f4ee3b232725f430883b11befbd"
     },
     {
       "path": "recipes/2p2d-cache.json",
       "bytes": 7188,
-      "sha256": "9974e5f2001275306c1410f09c17dda46634869143b0b5c945f7e33d894d28bd"
+      "sha256": "4f738b5774326f223a5dbf91bae345a72053a90465fb3bc0030ac7ff397fbc0c"
     },
     {
       "path": "recipes/cache-service.json",
@@ -168,13 +193,18 @@
     },
     {
       "path": "sources/vllm/Dockerfile",
-      "bytes": 2898,
-      "sha256": "4178fd7690a4f55f1af274eb7a1755c38aa58acbbc188f255d1381eba2afbb88"
+      "bytes": 3381,
+      "sha256": "c0e33cc830e1887dabadab4ed135373a156524a77b7fbe1504e92f0a61743b73"
     },
     {
       "path": "sources/vllm/Dockerfile.legacy",
       "bytes": 1076,
       "sha256": "d31fbc2fc0a6bdece84a4b506a0914b6417d68461dd10401a754c1ea67a14167"
+    },
+    {
+      "path": "sources/vllm/Dockerfile.lookup-progress",
+      "bytes": 612,
+      "sha256": "11a3fd86bc4e23c7db38b8f0f7f3439b1ce4911325e6470d378dbf80014a2d82"
     },
     {
       "path": "sources/vllm/LICENSE",
@@ -215,6 +245,36 @@
       "path": "sources/vllm/lmcache-cuda/verify-gpu.py",
       "bytes": 2949,
       "sha256": "a91f6734bc09c1d72ef83a26302c60942c0212716d3fb956e2c096405f503366"
+    },
+    {
+      "path": "sources/vllm/lookup-progress/README.md",
+      "bytes": 775,
+      "sha256": "9a0fb04201cdea75e2eaa266db4d1d89a5a6de2c938e4c16898b095da0e909f9"
+    },
+    {
+      "path": "sources/vllm/lookup-progress/apply-patch.py",
+      "bytes": 3824,
+      "sha256": "3f2087227cfecca0f9403d4f3a82b17f031e2d8048f03f94333040f80c792d32"
+    },
+    {
+      "path": "sources/vllm/lookup-progress/manifest.json",
+      "bytes": 895,
+      "sha256": "37aabd561824175ae4955aabdcc13c9fc9cdc5feb3f4f0bc0f489d1287b2a0c6"
+    },
+    {
+      "path": "sources/vllm/lookup-progress/patches/lmcache-result-progress.patch",
+      "bytes": 5266,
+      "sha256": "862e28130b7dcb0dbb326840b2280ddd2028bd162197d76614c5b144b897968a"
+    },
+    {
+      "path": "sources/vllm/lookup-progress/verify-cpu.py",
+      "bytes": 12759,
+      "sha256": "607cbb4b5e24958dab06b2cea1de29d4b03c0c5bacc64bdf67fbd7b36f1e4d8e"
+    },
+    {
+      "path": "sources/vllm/lookup-progress/verify-scheduler.py",
+      "bytes": 8806,
+      "sha256": "5474c2e740bda6a33e2b2f78cb215979c2b16e8a3b8d03532b49705a6efe82c3"
     },
     {
       "path": "sources/vllm/nightly-patches/patch-nixl-handshake.py",
@@ -408,13 +468,13 @@
     },
     {
       "path": "templates/runtime/next-start.py.in",
-      "bytes": 7449,
-      "sha256": "c0fe4a54a037808c0ff143cf1ae76090c530eddc6901452f0c679e9817a2033b"
+      "bytes": 9481,
+      "sha256": "f2e7c93e87800e62d51b9b57ed08f9e0e73a1cb852e8397ca7315cd1829a3bbc"
     },
     {
       "path": "templates/runtime/switch-pd.py.in",
-      "bytes": 84347,
-      "sha256": "ff3bd5378c7e3bc48cf2f7a205fa0290dff7986b3f0364b5ac8abcf3a0c0f389"
+      "bytes": 95423,
+      "sha256": "65db9e48500eb99466cf6454eecedc85e7c6c774e9ad55b9d64a8cf9e50e74b8"
     },
     {
       "path": "templates/runtime/switch-pd.sh",
@@ -428,13 +488,13 @@
     },
     {
       "path": "templates/runtime/verify-live-parameters.py.in",
-      "bytes": 17902,
-      "sha256": "568e13cd6786bf4de6fb45468538493fa634911dec4a353973db22bb62a1cb5e"
+      "bytes": 24056,
+      "sha256": "c1fc5ae950938e5ad36dafa4dcda28d0c6cffb6251b8d63e1b3950f787e574ec"
     },
     {
       "path": "templates/runtime/verify-model-features.py.in",
-      "bytes": 11191,
-      "sha256": "b25febeec9bfd4fa28db8ed4b2f5478ec43e90c013d262a8acabcb6efac73eff"
+      "bytes": 11890,
+      "sha256": "0e5f2e7b4b23882e609ce3a27b3d0469d6d78afe48ad9d244e64b07bc71df761"
     },
     {
       "path": "templates/runtime/verify-model-import.py.in",
@@ -443,8 +503,8 @@
     },
     {
       "path": "templates/runtime/verify-v032-migration.py.in",
-      "bytes": 21066,
-      "sha256": "e049c5bca4082f94c170ff388e2fe41dae87aff7075b5962796dd60d140b6d84"
+      "bytes": 21567,
+      "sha256": "c460a1921990d6603d4777d744aa06e01bb8f634c98181cbbc1ba6ae2a9c3e77"
     },
     {
       "path": "templates/runtime/worker/docker.py",
@@ -458,8 +518,13 @@
     },
     {
       "path": "tests/support.py",
-      "bytes": 2991,
-      "sha256": "347ae13aaedf4b30ba2745171224a06b566f88ada11794e20c8795e42351be3b"
+      "bytes": 5200,
+      "sha256": "1dabd6e3134a459888a2d045ab6541cc3f41416f84d001bafc20551eef295240"
+    },
+    {
+      "path": "tests/test_activation_validation.py",
+      "bytes": 2191,
+      "sha256": "978254ac4fd1cb6bfdbcbfa7e64d1c82e7db88975cb3f3d748e64ed993a72949"
     },
     {
       "path": "tests/test_cache_metrics.py",
@@ -468,18 +533,33 @@
     },
     {
       "path": "tests/test_configure.py",
-      "bytes": 9244,
-      "sha256": "bfa66a20b153dbc97326fd67066fe060a4dbb79d7d54ca484b2afa7cbd26e719"
+      "bytes": 10444,
+      "sha256": "0deb9fc1bbb99fc712fa9deb239f8b0ee2e263c9630a2794f8ce2052604dd63d"
+    },
+    {
+      "path": "tests/test_fp8_layout.py",
+      "bytes": 3440,
+      "sha256": "d050c29e5e4d3c27edf0c75d97eb69fbe4f7fd68095a8773dda05e15571dacab"
     },
     {
       "path": "tests/test_live_parameters.py",
-      "bytes": 1557,
-      "sha256": "a2d3335655233df7eb4171283ac486963d4460e8d29d587fd20a674dfb6f0f65"
+      "bytes": 2780,
+      "sha256": "47bd65971188a648f832b0d4b147fe5f1dba5c07f171737b726e1d4e770addf5"
+    },
+    {
+      "path": "tests/test_model_identity.py",
+      "bytes": 2904,
+      "sha256": "21a7febf68fb51b54afb1a7b403228e3f664df40643ec14fc2da3c85306cde7c"
     },
     {
       "path": "tests/test_next_start.py",
-      "bytes": 8792,
-      "sha256": "05b68b8463694da79e7eeb20835d14a316bd5c1ea5436eb38365483ebf0bd372"
+      "bytes": 13132,
+      "sha256": "1ce7793f04551351401aefd3b20effe552734b5d23f50d5b6fdb6b558907a046"
+    },
+    {
+      "path": "tests/test_prefill_progress_configuration.py",
+      "bytes": 2401,
+      "sha256": "6aa6b7de5087611bb91c7058aaee91ba7a02aacc1f26c4c3dec7b503e8961747"
     },
     {
       "path": "tests/test_public_audit.py",
@@ -488,8 +568,13 @@
     },
     {
       "path": "tests/test_switch.py",
-      "bytes": 42315,
-      "sha256": "f472e213db3fd513d2040b2a461e84e4a51d7ff18c4f9b40c8e3aca82050b04b"
+      "bytes": 47477,
+      "sha256": "8a1c7f012a253bcce3cda1d031fd27278cc829b181d57502bf46563726b4da10"
+    },
+    {
+      "path": "tools/analyze-fp8-layout.py",
+      "bytes": 6522,
+      "sha256": "6962a2086eaa2aeba75045a33ba575d9a57245a46c62a516753c9bcfad0b0b17"
     },
     {
       "path": "tools/apply-memory-patch.py",
@@ -502,19 +587,24 @@
       "sha256": "1eb20b05c270fd9abda6216193bba80ae936c522a24da4100355fb61dd1eac16"
     },
     {
+      "path": "tools/build-lookup-progress.py",
+      "bytes": 4109,
+      "sha256": "e04b69832e5eba94571447638161f7302f1ffce76c86299dd135977159c7b069"
+    },
+    {
       "path": "tools/build-stack.py",
       "bytes": 9785,
       "sha256": "ea3e3251bb59de0f5c0fc465bb95ffcef1fde41a3a276b0a79eff7c513fbd57d"
     },
     {
       "path": "tools/configure.py",
-      "bytes": 21227,
-      "sha256": "8f2e513712f53d56b52a690e02eb613fe3463cd910596e47eaf827eed6380714"
+      "bytes": 23406,
+      "sha256": "ab37cccaff4587d6c7c554451bb79315973ddaabcf64a996704b3b6b98f24645"
     },
     {
       "path": "tools/fetch-model.py",
-      "bytes": 3777,
-      "sha256": "2deeece4bcc2ea3a1c714c63393c98d4c706b9dd3290d5615e125766194d6724"
+      "bytes": 4275,
+      "sha256": "cc743429bae3072025f3472225a149a67d28b7a1fa153a13743e6aaa088cb8cd"
     },
     {
       "path": "tools/fetch-platform-images.py",

@@ -42,6 +42,14 @@ def png_url(rgb, size=512):
 
 
 
+def image_messages(count, size):
+    """每张图使用不同但仍以红色为主的像素，避免相同图片去重掩盖编码负载。"""
+    content = [{"type": "text", "text": "这些图片的主要颜色是什么？只用一个中文颜色词回答。"}]
+    content += [{"type": "image_url", "image_url": {"url": png_url((255, i % 64, (i * 3) % 64), size)}}
+                for i in range(count)]
+    return [{"role": "user", "content": content}]
+
+
 def private_output(value):
     """运行结果只写到私有目录；显式指定输出也不能写回源码仓库。"""
     path = Path(value)
@@ -158,13 +166,17 @@ def main():
         answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         record("工具结果回传", status == 200 and "20" in answer, status, seconds, output=answer)
 
-    for count in [1, 6]:
-        content = [{"type": "text", "text": "这些图片的主要颜色是什么？只用一个中文颜色词回答。"}]
-        content += [{"type": "image_url", "image_url": {"url": png_url((255, 0, 0))}} for _ in range(count)]
-        status, text, seconds = request(args.base, "/v1/chat/completions", chat([{"role": "user", "content": content}]))
+    for count, size in [(1, 512), (6, 512), (64, 1024)]:
+        messages = image_messages(count, size)
+        status, text, seconds = request(args.base, "/v1/chat/completions", chat(messages))
         data = json.loads(text) if status == 200 else {}
         answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        record(str(count) + "张图片", status == 200 and "红" in answer, status, seconds, output=answer)
+        record(str(count) + "张图片", status == 200 and "红" in answer, status, seconds,
+               image_pixels=size * size, distinct_images=count, output=answer)
+    # 数量越界必须在模型计算前拒绝，不能因放宽到64而取消无限累积保护。
+    invalid_messages = image_messages(65, 32)
+    status, text, seconds = request(args.base, "/v1/chat/completions", chat(invalid_messages))
+    record("65张图片按上限拒绝", status == 400 and '64' in text and 'image' in text.lower(), status, seconds)
 
     # 小规模并发只验证请求互不串扰及正常结束，不作为生产峰值吞吐或延迟结论。
     def concurrent_probe(number):

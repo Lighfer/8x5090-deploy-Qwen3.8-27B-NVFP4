@@ -50,11 +50,12 @@ class FakeHost:
             for name in (self.config["server_container"], self.config["worker_container"], self.config["proxy_container"], "external-business-fixture")}
         if initial != "1p1d-no-cache":
             service = switch.read_json(self.root / "cache-service.json")
+            service['config']['fields']['chunk_size'] = switch.mode_chunk_size(self.config, initial)
             self.caches[11] = {**service, "id": 11, "healthy": True, "state": "running"}
             for role in self.model["roles"]:
                 if role["name"] == "prefill":
                     role["extended_kv_cache"] = {"enabled": True, "mode": "shared", "cache_service_id": 11,
-                        "chunk_size": self.config["chunk_size"]}
+                        "chunk_size": switch.mode_chunk_size(self.config, initial)}
 
     def failure(self, phase):
         """指定边界只失败一次，允许验证独立回滚能否完成；永久失败另外显式指定。"""
@@ -257,11 +258,14 @@ class SwitchingTests(unittest.TestCase):
 
     def prepare(self, initial, target, fail=None, restart=True):
         host = FakeHost(self.root, initial, fail)
-        args = SimpleNamespace(mode=target, drain_timeout=0, restart=restart)
+        # 跨权重切换始终严格排空；合成引擎为零队列，给予两个空采样的观察时间。
+        args = SimpleNamespace(mode=target, drain_timeout=1 if switch.FP8_MODE in (initial, target) else 0, restart=restart)
         job = switch.prepare_job(host, args)
         return host, switch.Switch(host, job)
 
     def assert_layout(self, host, mode):
+        self.assertEqual(host.model['source'], 'local_path')
+        self.assertEqual(host.model['local_path'], self.site['paths']['fp8_model_directory' if mode == switch.FP8_MODE else 'model_directory'])
         roles = {r["name"]: r for r in host.model["roles"]}
         for name in ("prefill", "decode"):
             replicas, tp = switch.MODE_SHAPES[mode][name]
@@ -270,6 +274,7 @@ class SwitchingTests(unittest.TestCase):
             self.assertEqual(int(flags["--tensor-parallel-size"]), tp)
             self.assertEqual(flags["--speculative-config"]["num_speculative_tokens"], 3)
             self.assertEqual(flags["--default-chat-template-kwargs"]["reasoning_effort"], "xhigh")
+            self.assertEqual(flags['--kv-cache-dtype'], 'fp8_e4m3' if mode == switch.FP8_MODE else 'nvfp4')
         self.assertFalse((host.model.get("extended_kv_cache") or {}).get("enabled"))
         self.assertFalse((roles["decode"].get("extended_kv_cache") or {}).get("enabled"))
         self.assertEqual(host.model["id"], 1)
@@ -282,6 +287,10 @@ class SwitchingTests(unittest.TestCase):
             self.assertEqual(len(host.caches), 1)
             identifier = next(iter(host.caches))
             self.assertEqual(roles["prefill"]["extended_kv_cache"]["cache_service_id"], identifier)
+            # 平台响应中的池布局和P关联均独立检查，不能只比较生成器自己的目标对象。
+            expected_chunk = 1024 if mode == switch.FP8_MODE else 1536
+            self.assertEqual(host.caches[identifier]['config']['fields']['chunk_size'], expected_chunk)
+            self.assertEqual(roles['prefill']['extended_kv_cache']['chunk_size'], expected_chunk)
         live = switch.read_json(host.root / "pd-model-live.json")
         live_p = next(r for r in live["roles"] if r["name"] == "prefill")
         self.assertEqual((live_p.get("extended_kv_cache") or {}).get("cache_service_id"),
@@ -295,7 +304,7 @@ class SwitchingTests(unittest.TestCase):
         self.assertNotIn(switch.MARKER, host.active_nginx)
         self.assertTrue(all(host.opened_validated))
 
-    def test_all_nine_switch_directions(self):
+    def test_all_registered_switch_directions(self):
         # 每一对源/目标均重新建独立环境，验证缓存开关和 TP4/TP2 的组合边界。
         for initial in switch.MODES:
             for target in switch.MODES:
@@ -304,6 +313,77 @@ class SwitchingTests(unittest.TestCase):
                     task.execute()
                     self.assertEqual(task.state["phase"], "committed")
                     self.assert_layout(host, target)
+
+    def test_fp8_failure_restores_model_path_precision_and_cache(self):
+        """跨权重切换失败必须恢复真实模型目录，不能只恢复并发和实例数量。"""
+        for initial, target in [('2p2d-cache', switch.FP8_MODE), (switch.FP8_MODE, '1p1d-cache')]:
+            for phase in ('after-model-start', 'parameters', 'after-cache-create'):
+                with self.subTest(initial=initial, target=target, phase=phase):
+                    host, task = self.prepare(initial, target, fail=phase)
+                    task.execute()
+                    self.assertEqual(task.state['phase'], 'rolled-back')
+                    self.assert_layout(host, initial)
+
+    def test_missing_fp8_shard_rejected_before_entrance_changes(self):
+        host = FakeHost(self.root, '2p2d-cache')
+        Path(self.site['paths']['fp8_model_directory'], 'model.safetensors').unlink()
+        with self.assertRaisesRegex(switch.SwitchError, '分片缺失'):
+            switch.preflight(host, switch.FP8_MODE)
+        self.assertFalse(host.changes)
+        self.assertNotIn(switch.MARKER, host.active_nginx)
+
+    def test_model_metadata_changed_without_lock_update_is_rejected(self):
+        host = FakeHost(self.root, '2p2d-cache')
+        Path(self.site['paths']['fp8_model_directory'], 'tokenizer_config.json').write_text('{"changed":true}')
+        with self.assertRaisesRegex(switch.SwitchError, '配置缺失|SHA256'):
+            switch.preflight(host, switch.FP8_MODE)
+        self.assertFalse(host.changes)
+
+    def test_missing_alternative_weights_does_not_block_stop(self):
+        host = FakeHost(self.root, switch.FP8_MODE)
+        Path(self.site['paths']['fp8_model_directory'], 'model.safetensors').unlink()
+        switch.preflight(host, switch.FP8_MODE, 'stop')
+        self.assertFalse(host.changes)
+
+    def test_mode_signature_includes_model_path(self):
+        host = FakeHost(self.root, '1p1d-cache')
+        host.model['local_path'] = self.site['paths']['fp8_model_directory']
+        with self.assertRaisesRegex(switch.SwitchError, '正式方案不一致'):
+            switch.identify_mode(host, host.model)
+
+    def test_fp8_dynamic_kv_scales_are_rejected(self):
+        host = FakeHost(self.root, '1p1d-cache')
+        path = self.root / 'switch-profiles' / (switch.FP8_MODE + '.json')
+        value = switch.read_json(path)
+        value['roles'][0]['backend_parameters'].append('--calculate-kv-scales')
+        switch.write_json(path, value)
+        host.config['profile_sha256'][switch.FP8_MODE] = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(switch.SwitchError, '静态FP8'):
+            switch.preflight(host, switch.FP8_MODE)
+
+    def test_fp8_context_mismatch_auto_and_native_overflow_are_rejected(self):
+        """错误在关入口之前发现，不把两边独立auto或超过原生长度带入切换。"""
+        for value in ('auto', '204800', '524288'):
+            with self.subTest(value=value):
+                host = FakeHost(self.root, '2p2d-cache')
+                path = self.root / 'switch-profiles' / (switch.FP8_MODE + '.json')
+                profile = switch.read_json(path)
+                profile['roles'][0]['backend_parameters'] = [
+                    '--max-model-len=' + value if a.startswith('--max-model-len=') else a
+                    for a in profile['roles'][0]['backend_parameters']]
+                switch.write_json(path, profile)
+                host.config['profile_sha256'][switch.FP8_MODE] = hashlib.sha256(path.read_bytes()).hexdigest()
+                with self.assertRaisesRegex(switch.SwitchError, '固定上下文'):
+                    switch.preflight(host, switch.FP8_MODE)
+                self.assertFalse(host.changes)
+
+    def test_fp8_chunk_must_cover_complete_gpu_blocks(self):
+        """共享池沿用旧1536而GPU已改1024时，必须拒绝不整除的布局。"""
+        host = FakeHost(self.root, '2p2d-cache')
+        host.config['mode_chunk_sizes'][switch.FP8_MODE] = 1536
+        with self.assertRaisesRegex(switch.SwitchError, '不对齐'):
+            switch.preflight(host, switch.FP8_MODE)
+        self.assertFalse(host.changes)
 
     def test_healthy_same_mode_does_not_restart(self):
         host, task = self.prepare("1p1d-cache", "1p1d-cache", restart=False)

@@ -34,3 +34,19 @@ class CacheScopeTests(unittest.TestCase):
         for values in ([71],[71,83,97],[71,83,83],[]):
             with self.subTest(values=values), self.assertRaises(RuntimeError):
                 self.module.cache_gpu_scope(self.service(values),self.allowed,self.prefill)
+
+    def test_fp8_runtime_configuration_requires_actual_metrics(self):
+        """普通接口与引擎指标必须同时匹配；缺失证据不能按成功处理。"""
+        expected = {'--max-model-len': '262144', '--block-size': '1024', '--mamba-block-size': '1024'}
+        cards = {'data': [{'id': 'synthetic-model', 'max_model_len': 262144}]}
+        metric = ('vllm:cache_config_info{block_size="1024",mamba_block_size="1024",'
+                  'cache_dtype="fp8_e4m3",mamba_ssm_cache_dtype="bfloat16",num_gpu_blocks="512"} 1.0\n')
+        result = self.module.fp8_runtime_evidence(expected, 'synthetic-model', cards, metric)
+        self.assertTrue(result['passed'])
+        for bad in ('', metric.replace('block_size="1024"', 'block_size="1536"'),
+                    metric.replace('num_gpu_blocks="512"', 'num_gpu_blocks="0"')):
+            with self.subTest(metric=bad), self.assertRaises(RuntimeError):
+                self.module.fp8_runtime_evidence(expected, 'synthetic-model', cards, bad)
+        cards['data'][0]['max_model_len'] = 204800
+        with self.assertRaisesRegex(RuntimeError, '共同固定上限'):
+            self.module.fp8_runtime_evidence(expected, 'synthetic-model', cards, metric)

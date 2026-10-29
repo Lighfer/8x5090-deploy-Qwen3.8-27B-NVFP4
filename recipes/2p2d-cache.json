@@ -112,7 +112,7 @@
         "--mm-encoder-tp-mode=weights",
         "--mm-processor-device=cpu",
         "--no-skip-mm-profiling",
-        "--long-prefill-token-threshold=3072",
+        "--long-prefill-token-threshold=1536",
         "--long-prefill-token-threshold-adaptive"
       ],
       "extended_kv_cache": {

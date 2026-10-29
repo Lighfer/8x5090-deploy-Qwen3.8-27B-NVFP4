@@ -1,0 +1,17 @@
+{
+  "format": 1,
+  "release": "lmcache-result-progress-20261028",
+  "origin": "local fix based on the pinned LMCache 0.5.6 source",
+  "lmcache_version": "0.5.6",
+  "patch": "patches/lmcache-result-progress.patch",
+  "patch_sha256": "862e28130b7dcb0dbb326840b2280ddd2028bd162197d76614c5b144b897968a",
+  "original_files": {
+    "lmcache/integration/vllm/vllm_multi_process_adapter.py": "83b8784fa8d9c684ed90147aeb30b66e8cb797d54ae05a3aa38879ef8c6c6693",
+    "lmcache/integration/vllm/lmcache_mp_connector.py": "2f7d757d2073fc944ffac2d2c794f727623297fd69215741d423120fb724f986"
+  },
+  "final_files": {
+    "lmcache/integration/vllm/vllm_multi_process_adapter.py": "d79f18461a0d97d08d801895263f121d79252cc6081c3df402bfd54f919e921a",
+    "lmcache/integration/vllm/lmcache_mp_connector.py": "e2811c5d1a1c6dbfe9f9c4b5b05246c3a40a4d98ccccecd3b9c045603d6a58aa"
+  },
+  "gpu_performance_verified": false
+}

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import urllib.request
 
 
 # 本机已验证的固定环境同时包含原服务的CUDA、NCCL和编译选项，以及PD传输所需设置。
@@ -75,6 +76,42 @@ def options(arguments):
     return result
 
 
+def command_model_path(arguments):
+    """同时识别vLLM serve位置参数与旧API启动器的--model，拒绝只凭对外别名验收权重。"""
+    supplied = options(arguments).get('--model')
+    if isinstance(supplied, str):
+        return supplied
+    for index, item in enumerate(arguments[:-1]):
+        if item == 'serve' and arguments[index + 1].startswith('/'):
+            return arguments[index + 1]
+    return None
+
+
+def router_evidence(configured, logs, info, workers, expected_members):
+    """用启动记录或不可变启动配置结合实时注册表核对Router，避免日志轮转误报。
+
+    注册表必须与平台的全部P/D实例逐地址相等；缺失日志可以由固定镜像的启动参数
+    佐证，已有但冲突的策略日志则不能降级忽略。实际策略日志值保持原样记录，不能
+    把配置值伪写成运行时观测值。镜像内容身份由调用方单独核对。
+    """
+    declared = {role: configured.get('--' + role + '-policy', configured.get('--policy', 'cache_aware'))
+                for role in ('prefill', 'decode')}
+    observed = re.findall(r'PD stage policies active: prefill=([a-z_0-9]+), decode=([a-z_0-9]+)', logs)
+    actual = dict(zip(('prefill', 'decode'), observed[-1])) if observed else None
+    healthy = {(row.get('worker_type'), row.get('url', '').rstrip('/')) for row in workers
+               if row.get('is_healthy') is True}
+    command_pd = (configured.get('--enable-igw') is True and configured.get('--vllm-pd-disaggregation') is True
+                  and configured.get('--kv-connector') == 'nixl')
+    live_pd = (info.get('router_manager') is True and healthy == expected_members
+               and {role for role, _ in healthy} == {'prefill', 'decode'})
+    native = 'Multi-router mode enabled (enable_igw=true)' in logs or (command_pd and live_pd)
+    matches = actual == declared if actual is not None else command_pd and live_pd
+    return {'declared_stage_policies': declared, 'actual_stage_policies': actual,
+            'stage_policies_match': matches, 'native_multi_router_mode': native,
+            'policy_evidence': 'startup-log' if actual is not None else 'fixed-image-command-and-live-members',
+            'live_members_match': healthy == expected_members, 'runtime_info': info}
+
+
 def cache_gpu_scope(service, allowed_gpus, prefill_gpus):
     """缓存必须精确遵守平台声明，并覆盖全部P，且不能看到本方案以外的预留卡。
 
@@ -87,6 +124,39 @@ def cache_gpu_scope(service, allowed_gpus, prefill_gpus):
         raise RuntimeError('缓存GPU声明未覆盖P、包含预留卡或存在重复')
     return sorted(values)
 
+
+
+def fp8_runtime_evidence(expected, model_name, model_list, metrics):
+    """由普通模型接口和引擎指标确认实际值，不能只检查启动命令中的声明。
+
+    框架可能自动上调不合适的管理块。指标来自引擎初始化后的CacheConfig，
+    因而可以发现命令写1024、实际却使用其他块大小的情况；不启用开发接口。
+    缺失或矛盾时终止验证，由正式事务执行器恢复原部署后再恢复入口。
+    """
+    cards = [row for row in model_list.get('data', []) if row.get('id') == model_name]
+    wanted_length = int(expected['--max-model-len'])
+    if len(cards) != 1 or cards[0].get('max_model_len') != wanted_length:
+        raise RuntimeError('FP8实际上下文与P/D共同固定上限不一致')
+    rows = []
+    for line in metrics.splitlines():
+        match = re.fullmatch(r'vllm:cache_config_info\{(.*)\}\s+(\S+)(?:\s+\S+)?', line.strip())
+        if match and float(match[2]) == 1:
+            labels = {name: json.loads('"' + value + '"') for name, value in
+                      re.findall(r'([a-zA-Z_][a-zA-Z_0-9]*)="((?:\\.|[^"\\])*)"', match[1])}
+            rows.append(labels)
+    if not rows:
+        raise RuntimeError('FP8实际缓存配置指标缺失，不能只凭启动参数恢复访问')
+    wanted = {'block_size': str(expected['--block-size']),
+              'mamba_block_size': str(expected['--mamba-block-size']),
+              'cache_dtype': 'fp8_e4m3', 'mamba_ssm_cache_dtype': 'bfloat16'}
+    for row in rows:
+        if any(row.get(key) != value for key, value in wanted.items()):
+            raise RuntimeError('FP8引擎实际缓存布局与正式配方不一致')
+        if not row.get('num_gpu_blocks', '').isdigit() or int(row['num_gpu_blocks']) <= 1:
+            raise RuntimeError('FP8引擎没有足够的实际GPU缓存块')
+    return {'passed': True, 'max_model_len': wanted_length,
+            'cache_config': [{key: row[key] for key in (*wanted, 'num_gpu_blocks')} for row in rows],
+            'evidence_source': '/v1/models and /metrics; no development endpoints'}
 
 
 def private_output(value):
@@ -128,6 +198,9 @@ def main():
             # 共享PID空间后，容器里的PID 1属于Worker；读取Docker记录的实际入口进程，核对真正的vLLM参数。
             command=(Path('/proc') / str(inspect['State']['Pid']) / 'cmdline').read_bytes().decode().split('\0')
             actual=options(command);expected=options(data['effective'][role])
+            actual_model_path=command_model_path(command)
+            expected_model_path=data['model_export']['local_path']
+            model_path_matches=actual_model_path==expected_model_path
             differences={key:dict(expected=value,actual=actual.get(key)) for key,value in expected.items() if actual.get(key)!=value}
             declared_image=data['effective_images'][role]
             declared_image_id=subprocess.check_output(['docker','image','inspect','-f','{{.Id}}',declared_image],text=True).strip()
@@ -172,13 +245,30 @@ def main():
             cache=next(r.get('extended_kv_cache',{}) for r in data['model_export']['roles'] if r['name']==role) or {}
             expected_shared=role=='prefill' and cache.get('enabled',False)
             connectors_match='NixlConnector' in transfer and ('LMCacheMPConnector' in transfer)==expected_shared
+            runtime_evidence = None
+            if expected.get('--quantization') == 'fp8':
+                # 在切换已排空、引擎就绪后才运行；仅GET，不触发推理或在线校准。
+                base = 'http://' + instance['worker_ip'] + ':' + str(instance['port'])
+                with urllib.request.urlopen(base + '/v1/models', timeout=15) as response:
+                    runtime_models = json.load(response)
+                with urllib.request.urlopen(base + '/metrics', timeout=15) as response:
+                    runtime_metrics = response.read().decode()
+                runtime_evidence = fp8_runtime_evidence(expected, data['model_export']['name'],
+                                                        runtime_models, runtime_metrics)
+                if expected_shared:
+                    services = [s for s in data['cache_services'] if s['id'] == cache['cache_service_id']]
+                    if (len(services) != 1 or services[0]['config']['fields']['chunk_size'] != cache['chunk_size']
+                            or cache['chunk_size'] % int(expected['--block-size'])):
+                        raise RuntimeError('FP8运行中的CPU池分块与P关联或实际GPU块不一致')
             checks.append(dict(role=role,instance_id=instance['id'],container=name,image_id=inspect['Image'],vllm_version=vllm_version,
                 declared_flags=len(expected),all_declared_parameters_present=not differences,differences=differences,
+                actual_model_path=actual_model_path,expected_model_path=expected_model_path,model_path_matches=model_path_matches,
                 pid_namespace=pid_namespace,worker_pid_namespace=worker_pid_namespace,nixl_namespace_matches=nixl_namespace_matches,
                 actual_parameters=actual,selected_environment=environment,http_port=instance['port'],gpu_indexes=indices,
                 environment_matches=not environment_differences,environment_differences=environment_differences,
                 gpu_count_matches=gpu_count_matches,mtp_enabled=mtp_enabled,connectors_match=connectors_match,
-                declared_image=declared_image,declared_image_id=declared_image_id,image_matches=inspect['Image']==declared_image_id))
+                declared_image=declared_image,declared_image_id=declared_image_id,image_matches=inspect['Image']==declared_image_id,
+                fp8_runtime_evidence=runtime_evidence))
     # Router 的进程会重写 argv 标题，不能只看 /proc/1/cmdline；同时核对角色镜像与原生启动模式。
     router_instances=[i for i in data['instances'] if i['role']=='router' and str(i['state']).lower()=='running']
     if len(router_instances)!=1:raise RuntimeError('Expected one running Router instance')
@@ -193,15 +283,18 @@ def main():
     expected_router_parameters=options(router_role.get('backend_parameters') or [])
     router_parameter_differences={key:dict(expected=value,actual=configured.get(key))
         for key,value in expected_router_parameters.items() if configured.get(key)!=value}
-    observed=re.findall(r'PD stage policies active: prefill=([a-z_0-9]+), decode=([a-z_0-9]+)',logs)
-    observed_policies=dict(zip(['prefill','decode'],observed[-1])) if observed else None
-    declared_policies={role:configured.get('--'+role+'-policy',configured.get('--policy','cache_aware')) for role in ['prefill','decode']}
+    router_base='http://'+router_instances[0]['worker_ip']+':'+str(router_instances[0]['port'])
+    live_router={}
+    for route in ('get_server_info', 'workers'):
+        with urllib.request.urlopen(router_base+'/'+route, timeout=10) as response:
+            live_router[route]=json.loads(response.read())
+    expected_members={(item['role'],'http://'+item['worker_ip']+':'+str(item['port']))
+                      for item in data['instances'] if item['role'] in ('prefill','decode')}
+    evidence=router_evidence(configured,logs,live_router['get_server_info'],live_router['workers'].get('workers',[]),expected_members)
     router=dict(container=router_name,image_id=router_image,
-        declared_image=router_declared,declared_stage_policies=declared_policies,actual_stage_policies=observed_policies,
+        declared_image=router_declared,**evidence,
         explicit_parameter_differences=router_parameter_differences,explicit_parameters_match=not router_parameter_differences,
-        stage_policies_match=observed_policies==declared_policies,
-        dedicated_image_matches=router_image==expected_router_image,
-        native_multi_router_mode='Multi-router mode enabled (enable_igw=true)' in logs)
+        dedicated_image_matches=router_image==expected_router_image)
     unique_gpus=len(assigned_gpus)==len(set(assigned_gpus)) and sorted(assigned_gpus)==expected_gpus
     cache_visibility_matches=True
     expected_cache_gpus=[]
@@ -220,9 +313,9 @@ def main():
             cache_env=dict(e.split('=',1) for e in cache_inspect['Config']['Env'])
             cache_visibility_matches=cache_visibility_matches and sorted(int(x) for x in cache_env.get('CUDA_VISIBLE_DEVICES','').split(',') if x)==expected_cache_gpus
     report=dict(at=datetime.datetime.now(datetime.timezone.utc).isoformat(),gpu_assignment_complete_and_disjoint=unique_gpus,expected_gpu_indexes=expected_gpus,cache_gpu_visibility_matches=cache_visibility_matches,expected_cache_gpu_indexes=expected_cache_gpus,
-        passed=all(c['all_declared_parameters_present'] and c['gpu_count_matches'] and c['mtp_enabled'] and c['connectors_match'] and c['image_matches'] and c['nixl_namespace_matches'] and c['environment_matches'] for c in checks)
+        passed=all(c['all_declared_parameters_present'] and c['model_path_matches'] and c['gpu_count_matches'] and c['mtp_enabled'] and c['connectors_match'] and c['image_matches'] and c['nixl_namespace_matches'] and c['environment_matches'] for c in checks)
             and unique_gpus and cache_visibility_matches and router['dedicated_image_matches'] and router['native_multi_router_mode']
-            and router['stage_policies_match'] and router['explicit_parameters_match'],
+            and router['stage_policies_match'] and router['explicit_parameters_match'] and router['live_members_match'],
         inheritance_source='GPUStack v2.3.0 gpustack.schemas.models.role_effective_model',
         decode_role_override=data['decode_override'],decode_inherits_top=data['decode_override'] is None,checks=checks,router=router)
     Path(args.output).write_text(json.dumps(report,ensure_ascii=False,indent=2))

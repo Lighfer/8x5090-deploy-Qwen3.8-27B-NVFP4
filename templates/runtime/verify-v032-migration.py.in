@@ -80,7 +80,7 @@ def generate(base, headers, tokens, nonce, concurrent, long_output=False, prompt
         # 单独的持续生成阶段用于观察P/D重叠；不混入前面20个检索请求的对照统计。
         prompt += '\n先给出唯一核验标记，再从1到300逐行列出n+1=结果的完整算式。每行纯文本，不能省略，不能用代码代替。'
     payload = {"model": @@MODEL_NAME_PY@@, "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 3072 if long_output else 512, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}
+        "max_tokens": 3072 if long_output else 1024, "temperature": 0, "stream": True, "stream_options": {"include_usage": True}}
     started = time.monotonic()
     first = None
     content = []
@@ -242,7 +242,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--job", type=Path, required=True)
     args = parser.parse_args()
-    if getattr(args, 'job', None): args.job = private_output(args.job)
+    # 输出检查返回字符串；后续持续使用Path拼接事务文件，必须保留路径类型。
+    if getattr(args, 'job', None): args.job = Path(private_output(args.job))
     state = json.loads((args.job / "state.json").read_text())
     config = json.loads((ROOT / "switch-config.json").read_text())
     base = config["entry_url"]
@@ -294,7 +295,9 @@ def main():
     started = time.monotonic()
     benchmark_after = {}
     try:
-        for concurrency, contexts in [(1, [1024, 16384, 98304, 190000]),
+        # 原NVFP4模式保留原边界；FP8的共同上限更高，增加接近上限的真实检索。
+        large_context = 250000 if state['target'] == '1p1d-cache-fp8' else 190000
+        for concurrency, contexts in [(1, [1024, 16384, 98304, large_context]),
                                       (4, [1024, 16384, 65536, 98304]),
                                       (12, [1024, 16384, 65536] * 4)]:
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -304,7 +307,7 @@ def main():
                     # 每个完成结果立即保留，后续某个长请求失败也能追溯前面的实际样本。
                     with (args.job / "context-request-results.jsonl").open("a") as output:
                         output.write(json.dumps(samples[-1], ensure_ascii=False) + "\n")
-        if state['target'] == '1p1d-cache':
+        if state['target'] in ('1p1d-cache', '1p1d-cache-fp8'):
             with ThreadPoolExecutor(max_workers=8) as pool:
                 futures = [pool.submit(generate, base, headers, size, uuid.uuid4().hex, 8, True)
                     for size in [1024, 16384, 65536, 98304] * 2]
@@ -318,6 +321,8 @@ def main():
         for name, url in engines.items():
             text, benchmark_after[name] = metrics(url)
             (args.job / (name + '-metrics-after.txt')).write_text(text)
+        if not all(item['default_thinking'] for item in samples):
+            raise RuntimeError('检索样本没有全部覆盖默认思考，不能宣称默认xhigh回归通过')
         cache_enabled = state["with_cache"]
         cache_proof = {"enabled": cache_enabled}
         if cache_enabled:
@@ -363,7 +368,7 @@ def main():
         "statistics_by_concurrency": groups, "engine_counter_deltas": changes, "cache_proof": cache_proof,
         'mtp_proof': mtp_proof,
         'overlap_requests': overlap_samples,
-        "scope": "合成上下文升级回归；小样本分位数不代表完整生产尾延迟；请求未覆盖模型默认xhigh；包含GPU和引擎原始采样"}
+        "scope": "合成上下文升级回归；保留模型默认xhigh；小样本分位数不代表完整生产尾延迟；包含GPU和引擎原始采样"}
     (args.job / "extended-verification.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps({"passed": True, "requests": len(samples), "seconds": elapsed, "cache_proof": cache_proof}, ensure_ascii=False))
 

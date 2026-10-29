@@ -1,0 +1,107 @@
+--- a/lmcache/integration/vllm/vllm_multi_process_adapter.py
++++ b/lmcache/integration/vllm/vllm_multi_process_adapter.py
+@@ -1,7 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ # Standard
++from collections import OrderedDict
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol
+ import enum
+@@ -740,8 +741,11 @@
+         #   even after the server has already popped the job (exactly-once).
+         # - _per_server_hits: {request_id: {server_url: hit_chunks}}.
+         #   Per-server hit counts, used to detect disagreement and free tail locks.
+         self._pending_lookups: set[str] = set()
++        # 按提交顺序轮转尚未完成的查询；取消时直接删除，避免残留队列增长。
++        # 只由调度线程访问，不增加后台线程或改变原有future的线程边界。
++        self._lookup_progress: OrderedDict[str, None] = OrderedDict()
+         self._unacked_lookups: dict[str, _LookupAck] = {}
+         self._finished_lookup_results: dict[str, int] = {}
+         self._per_server_hits: dict[str, dict[str, int]] = {}
+         # request_id -> server URL -> (in-flight status future, submission time).
+@@ -913,8 +917,9 @@
+         self._unacked_lookups[request_id] = _LookupAck(
+             futures=futures, submitted_at=time.monotonic()
+         )
+         self._pending_lookups.add(request_id)
++        self._lookup_progress[request_id] = None
+         self._lookup_params[request_id] = (token_ids, cache_salt, request_configs)
+ 
+     def _free_inconsistent_lookup_locks(
+         self,
+@@ -952,8 +957,48 @@
+                     cache_salt=cs or "",
+                     request_configs=request_configs,
+                 ).no_worker_id_version()
+                 self.req_clients[url].free_lookup_locks(tail_key, self.tp_size)
++
++    def progress_pending_lookups(
++        self, max_requests: int = 64, time_budget_s: float = 0.001
++    ) -> int:
++        """限量推进已提交查询，不要求本轮还有可分配的计算token。
++
++        连接器元数据回调在计算预算耗尽时仍会执行。这里复用原查询状态机，
++        保留LOOKUP确认先于状态查询的顺序；完成值留在原结果缓存中，供正式
++        准入路径读取。不会分配GPU块、改变请求状态或释放仍需导入的读锁。
++
++        未完成项轮转到队尾，完成与取消项及时移除。时间限制是调用之间检查的
++        软预算，不能强行中断单次本地操作；阻塞查询模式不进入这个推进路径。
++        """
++        if (
++            not self._nonblocking_lookup_status
++            or max_requests <= 0
++            or time_budget_s <= 0
++        ):
++            return 0
++
++        deadline = time.monotonic() + time_budget_s
++        checked = 0
++        for _ in range(min(max_requests, len(self._lookup_progress))):
++            request_id, _value = self._lookup_progress.popitem(last=False)
++            if (
++                request_id in self._pending_lookups
++                and request_id not in self._finished_lookup_results
++            ):
++                # 先放回队尾；原状态机抛错时也不丢失尚未完成的登记项。
++                self._lookup_progress[request_id] = None
++                result = self.check_lookup_result(request_id)
++                checked += 1
++                if result is not None:
++                    # 超时或服务失联的零命中回退同样固定下来，避免恢复健康后
++                    # 再次消费已经终止的状态查询；正常完成值由原状态机缓存。
++                    self._finished_lookup_results.setdefault(request_id, result)
++                    self._lookup_progress.pop(request_id, None)
++            if time.monotonic() >= deadline:
++                break
++        return checked
+ 
+     @_lmcache_nvtx_annotate
+     def check_lookup_result(self, request_id: str) -> int | None:
+         """
+@@ -1083,8 +1128,9 @@
+         Args:
+             request_id: The ID of the finished request.
+         """
+         self._pending_lookups.discard(request_id)
++        self._lookup_progress.pop(request_id, None)
+         self._unacked_lookups.pop(request_id, None)
+         self._lookup_status.pop(request_id, None)
+         self._finished_lookup_results.pop(request_id, None)
+         self._per_server_hits.pop(request_id, None)
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -1473,8 +1473,12 @@
+ 
+         Args:
+             scheduler_output (SchedulerOutput): the scheduler output object.
+         """
++        # vLLM每轮均生成连接器元数据，MultiConnector也会无条件转发。
++        # 因此即使Running耗尽计算预算，已提交缓存结果仍能独立推进；
++        # 正式GPU准入、缓存导入和读锁释放继续由原有路径处理。
++        self.scheduler_adapter.progress_pending_lookups()
+         metadata = LMCacheMPConnectorMetadata()
+         metadata.need_flush_before_forward = _has_preemption_reqs(scheduler_output)
+ 
+         self._process_retrieve_requests(metadata)

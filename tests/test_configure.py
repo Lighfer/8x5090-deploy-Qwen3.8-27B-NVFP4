@@ -56,7 +56,8 @@ class ConfigureTests(unittest.TestCase):
                 self.assertEqual(config['initial_mode'], site['default_mode'])
                 for mode in configure.MODES:
                     model = json.loads((target / 'switch-profiles' / (mode + '.json')).read_text())
-                    self.assertEqual(model['local_path'], site['paths']['model_directory'])
+                    expected_path = site['paths']['fp8_model_directory' if mode == configure.FP8_MODE else 'model_directory']
+                    self.assertEqual(model['local_path'], expected_path)
                     self.assertEqual(model['worker_selector']['node'], site['names']['worker_label'])
                     self.assertEqual(model['cluster_name'], site['names']['cluster'])
                     self.assertEqual(model['image_name'], site['images']['runtime'])
@@ -77,6 +78,26 @@ class ConfigureTests(unittest.TestCase):
         self.assertIn('model_id=47', (target / 'verify-live-parameters.py').read_text())
         self.assertIn('worker_id=83', (target / 'entrypoint/metrics-bridge.py').read_text())
         self.assertEqual(json.loads((target / 'cache-service.json').read_text())['cluster_id'], 19)
+
+    def test_legacy_input_does_not_guess_fp8_directory(self):
+        """旧输入继续生成四种模式；缺少新目录时不能把原路径假扮成FP8模型。"""
+        self.site['paths'].pop('fp8_model_directory')
+        self.store()
+        configure.checked_site(self.path)
+        files = configure.generated_files(self.site, Path(self.site['paths']['deployment']), fake_images(self.site))
+        self.assertNotIn('switch-profiles/' + configure.FP8_MODE + '.json', files)
+        self.site['default_mode'] = configure.FP8_MODE
+        self.store()
+        with self.assertRaises(ValueError):
+            configure.checked_site(self.path)
+
+    def test_fp8_requires_separate_explicit_directory(self):
+        """复用原权重目录或移出Worker挂载父目录均应在生成前被拒绝。"""
+        for value in (self.site['paths']['model_directory'], str(self.base / 'outside-model')):
+            self.site['paths']['fp8_model_directory'] = value
+            self.store()
+            with self.assertRaises(ValueError):
+                configure.checked_site(self.path)
 
     def test_modified_generated_file_is_rejected_before_write(self):
         configure.prepare(self.path, execute=True, image_reader=fake_images)

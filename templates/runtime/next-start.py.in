@@ -61,12 +61,50 @@ def validated_files(root, plan, allow_old=False):
         if digest(data) != item['before_sha256']:
             raise RuntimeError('旧配置备份身份不符：' + relative)
         accepted = {item['after_sha256']}
+        # 首次启用会生成包含实际节点选择器和缓存编号的运行导出。只有同一
+        # 激活事务预先登记的精确输出散列可被接受，其他手工改动仍须拒绝。
+        if (relative in MODEL_EXPORT_FILES and plan.get('phase') in ('activating', 'applied', 'restoring')
+                and item.get('export_job') == plan.get('activation_job')
+                and item.get('export_after_sha256')):
+            accepted.add(item['export_after_sha256'])
         if allow_old:
             accepted.add(item['before_sha256'])
         if digest(path.read_bytes()) not in accepted:
             raise RuntimeError('文件被其他维护修改，拒绝覆盖：' + relative)
         values.append((path, data, item.get('mode', 0o600)))
     return values
+
+
+# 只有这些可再生导出允许登记运行时结果；脚本、配方、模型锁和认证文件不在范围内。
+MODEL_EXPORT_FILES = frozenset({'pd-model-live.json', 'pd-model-live.yaml', 'pd-model-stopped.yaml',
+    'pd-model-1p1d-stopped.yaml', 'pd-model-2p2d-stopped.yaml', 'pd-model-1p2d-6gpu-stopped.yaml',
+    'pd-model-1p1d-fp8-stopped.yaml'})
+
+
+def register_exports(root, job_id, outputs):
+    """先校验原文件，再登记当前事务即将生成的输出，最后由调用方原子写入。
+
+    先登记可保证中断在部分导出之后仍能恢复：尚未写出的文件匹配准备散列，
+    已写出的文件匹配已登记输出散列。此函数不接受未知路径或先改后登记。
+    """
+    marker = Path(root) / 'next-start-release.json'
+    if not marker.exists():
+        return
+    plan = read(marker)
+    if plan['phase'] not in ('activating', 'applied'):
+        return
+    if plan.get('activation_job') != job_id:
+        if plan['phase'] == 'activating':
+            raise RuntimeError('运行导出不属于当前激活事务')
+        return
+    if set(outputs) - MODEL_EXPORT_FILES:
+        raise RuntimeError('运行导出包含未允许的文件')
+    validated_files(root, plan)
+    for name, content in outputs.items():
+        if name in plan['files']:
+            plan['files'][name].update(export_job=job_id,
+                export_after_sha256=digest(content.encode() if isinstance(content, str) else content))
+    save(marker, plan)
 
 
 def bind(root, job_id):
@@ -151,7 +189,7 @@ def apply_at_boot(root):
             manager = read(root / 'model-state.json')
             if manager.get('running') is not True:
                 return 0
-            mode = manager['last_mode']
+            mode = switch.pending_start_mode(host) or manager['last_mode']
             switch.preflight(host, mode, 'start')
             current = host.call('GET', '/v2/models/' + str(host.config['model_id']))
             instances = host.call('GET', '/v2/models/' + str(host.config['model_id']) + '/instances')['items']

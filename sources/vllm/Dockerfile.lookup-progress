@@ -1,0 +1,12 @@
+# 增量构建必须由维护者显式提供已校验、包含旧修复和LMCache CUDA重建的基础镜像。
+# 完整跨机器复现使用相邻Dockerfile；此文件只避免重复编译未改变的二进制扩展。
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ENTRYPOINT []
+CMD []
+ENV NVIDIA_VISIBLE_DEVICES=void
+COPY lookup-progress/ /opt/gpustack-v032/lookup-progress/
+RUN python3 -B /opt/gpustack-v032/lookup-progress/apply-patch.py --execute && \
+    python3 -B /opt/gpustack-v032/lookup-progress/verify-cpu.py
+ENV NVIDIA_VISIBLE_DEVICES=all
+LABEL local.gpustack.lookup-progress="lmcache-result-progress-20261028"

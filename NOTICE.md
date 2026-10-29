@@ -13,3 +13,5 @@
 源码、镜像、模型与SDK的公开取得方式见[构建与固定输入](docs/04-补丁与构建.md)。发行包不包含权重、镜像层、编译库或SDK。
 
 修改声明：`templates/runtime/worker/fastfetch.py`是在GPUStack原始模块上应用LXC内存修正的版本；同目录`docker.py`是在Runtime原始模块上应用显式PID命名空间修正的版本。Router与NIXL补丁脚本内含修改后的源码片段；FlashInfer差异来自上述官方修复，未把第三方文件重新声明为MIT。
+
+修改声明补充：`sources/vllm/lookup-progress/patches/lmcache-result-progress.patch`为基于固定LMCache源码的本地差异，增加调度线程中的有界查询进度队列，并复用原状态机和元数据回调；该差异不是声称已经合并的官方提交，派生的第三方源码继续遵循Apache-2.0。应用器、验证工具和说明保留本仓库自行编写部分的许可。

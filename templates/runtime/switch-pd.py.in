@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""管理模型的四种部署方案及启停；事务失败恢复原方案和启停状态，期间隔离外部生成。"""
+"""管理独立权重与缓存精度的部署方案及启停，事务失败恢复原模型和入口状态。"""
 
 import argparse
 from collections import Counter
@@ -26,13 +26,15 @@ import uuid
 # 防止运行维护工具在冻结版本和生产目录生成没有登记的字节码文件。
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent
-MODES = ("1p1d-cache", "1p1d-no-cache", "2p2d-cache", "1p2d-6gpu-cache")
+FP8_MODE = "1p1d-cache-fp8"
+MODES = ("1p1d-cache", "1p1d-no-cache", "2p2d-cache", "1p2d-6gpu-cache", FP8_MODE)
 # 每个角色独立记录副本数和张量并行卡数，六卡方案不能复用两侧副本相同的假设。
 MODE_SHAPES = {
     "1p1d-cache": {"prefill": (1, 4), "decode": (1, 4)},
     "1p1d-no-cache": {"prefill": (1, 4), "decode": (1, 4)},
     "2p2d-cache": {"prefill": (2, 2), "decode": (2, 2)},
     "1p2d-6gpu-cache": {"prefill": (1, 2), "decode": (2, 2)},
+    FP8_MODE: {"prefill": (1, 4), "decode": (1, 4)},
 }
 STOP_MARKER = "# gpustack-model-stopped"
 STOP_LINES = "            " + STOP_MARKER + "\n            return 503;\n"
@@ -40,6 +42,7 @@ TERMINAL = {"committed", "unchanged", "rolled-back", "aborted"}
 JOB_PATTERN = re.compile(r"\d{8}T\d{6}-[a-f0-9]{8}")
 MARKER = "# gpustack-pd-switch:"
 PROFILE_FIELDS = (
+    "source", "local_path",
     "backend", "backend_version", "backend_parameters", "image_name", "run_command",
     "env", "roles", "disaggregation", "extended_kv_cache", "speculative_config",
     "distributed_inference_across_workers", "cpu_offloading", "gpu_selector",
@@ -214,12 +217,119 @@ def profile_signature(model):
     return result
 
 
+def configured_modes(host):
+    """旧安装可以尚未提供FP8目录，只读取已登记完整性散列的实际可用方案。"""
+    return tuple(mode for mode in MODES if mode in host.config['profile_sha256'])
+
+
+def mode_model_path(config, mode):
+    """模型路径属于模式身份；没有显式FP8输入时，不能把NVFP4路径当作FP8默认值。"""
+    value = config.get('mode_model_paths', {}).get(mode)
+    if value is None and mode != FP8_MODE:
+        value = config['model_path']
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise SwitchError('方案缺少明确的模型路径：' + mode)
+    return value
+
+
+def mode_chunk_size(config, mode):
+    """按目标模式选择CPU缓存分块，旧安装仍可读取原有全局字段。
+
+    该值只用于本次目标池和P关联。失败回滚始终恢复实际原快照，
+    不能用FP8目标分块重写NVFP4缓存，反方向也一样。
+    """
+    value = config.get('mode_chunk_sizes', {}).get(mode, config.get('chunk_size'))
+    if type(value) is not int or value <= 0:
+        raise SwitchError('方案的共享缓存分块必须为正整数：' + mode)
+    return value
+
+
+def pending_start_mode(host):
+    """准备目标只影响下一次start；显式模式和stop始终保留调用者或当前服务的意图。"""
+    marker = host.root / 'next-start-release.json'
+    if not marker.exists():
+        return None
+    plan = read_json(marker)
+    mode = plan.get('target_mode') if plan.get('phase') == 'prepared' else None
+    if mode is not None and mode not in configured_modes(host):
+        raise SwitchError('下次启动目标尚未配置，拒绝退回其他模型：' + str(mode))
+    return mode
+
+
+def validate_model_inputs(host, mode, profile):
+    """关入口前核对固定模型输入，不加载模型或启动GPU。
+
+    小型配置与分词器核对完整SHA256；权重分片核对索引、存在性和固定大小，避免
+    每次切换都顺序读取整份权重挤占生产磁盘带宽。全量权重散列由fetch-model.py
+    的verify-only路径完成；这里不把大小检查表述为完成了全量内容校验。
+    """
+    expected = mode_model_path(host.config, mode)
+    if profile.get('source') != 'local_path' or profile.get('local_path') != expected:
+        raise SwitchError('方案模型路径与独立登记不一致：' + mode)
+    precision = 'fp8' if mode == FP8_MODE else 'nvfp4'
+    locks = host.config.get('model_lock_sha256')
+    if locks is None:
+        # 没有模型清单的旧安装仍可安全停用/维护NVFP4；新增FP8必须先升级生成器。
+        if mode == FP8_MODE:
+            raise SwitchError('FP8方案缺少固定模型文件清单')
+        return
+    manifest = host.root / 'model-inputs' / (precision + '.json')
+    if manifest.is_symlink() or hashlib.sha256(manifest.read_bytes()).hexdigest() != locks.get(precision):
+        raise SwitchError('模型文件清单身份不符：' + precision)
+    directory = Path(expected)
+    if directory.is_symlink() or not directory.is_dir():
+        raise SwitchError('模型目录不存在或为符号链接：' + precision)
+    rows = {row['path']: row for row in read_json(manifest)['files']}
+    critical = {'config.json', 'model.safetensors.index.json', 'generation_config.json',
+                'chat_template.jinja', 'tokenizer.json', 'tokenizer_config.json', 'vocab.json',
+                'merges.txt', 'preprocessor_config.json', 'video_preprocessor_config.json'}
+    if not critical <= set(rows):
+        raise SwitchError('模型清单缺少启动必需文件：' + precision)
+    for name in critical:
+        path = directory / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != rows[name]['bytes']:
+            raise SwitchError('模型配置缺失或大小不符：' + name)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != rows[name]['sha256']:
+            raise SwitchError('模型配置SHA256不符：' + name)
+    index = read_json(directory / 'model.safetensors.index.json')['weight_map']
+    shards = set(index.values())
+    if not shards or shards != {name for name in rows if name.endswith('.safetensors')}:
+        raise SwitchError('模型权重索引与固定分片清单不符：' + precision)
+    for name in shards:
+        if Path(name).name != name:
+            raise SwitchError('权重索引不能跳出模型目录')
+        path = directory / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != rows[name]['bytes']:
+            raise SwitchError('模型权重分片缺失或大小不符：' + name)
+    config = read_json(directory / 'config.json')
+    quant = config.get('quantization_config') or {}
+    if not any('mtp' in name for name in index):
+        raise SwitchError('模型检查点缺少MTP权重')
+    if precision == 'fp8':
+        text = config.get('text_config', config)
+        if quant.get('quant_method') != 'fp8' or quant.get('weight_block_size') != [128, 128]:
+            raise SwitchError('FP8模型不是固定的128×128分组格式')
+        if text.get('intermediate_size', 0) % (4 * 128) or text.get('num_key_value_heads') != 4:
+            raise SwitchError('FP8模型的分组宽度或KV头数不满足此TP4配方')
+        # 使用固定共同上限；独立auto可能使P/D得到不同长度。原生框架还会
+        # 在真正启动时核对每张卡能否容纳一个最大请求，未通过不能放开入口。
+        limits = [parse_options(scope['backend_parameters']).get('--max-model-len')
+                  for scope in (profile, *[r for r in profile['roles'] if r['name'] in ('prefill', 'decode')])]
+        native = text.get('max_position_embeddings')
+        if (len(limits) != 3 or any(not str(v).isdigit() for v in limits)
+                or len(set(map(int, limits))) != 1 or type(native) is not int
+                or not 0 < int(limits[0]) <= native):
+            raise SwitchError('FP8的顶层/P/D必须使用一致且不超过模型原生范围的固定上下文')
+    elif quant.get('quant_method') not in ('modelopt', 'modelopt_mixed'):
+        raise SwitchError('NVFP4模式不能指向另一种权重格式')
+
+
 def identify_mode(host, model):
     """识别完整正式配置；升级过渡仅接受身份已核对的旧推理镜像。"""
     signature = profile_signature(model)
     cached = any((r.get('extended_kv_cache') or {}).get('enabled') for r in model.get('roles') or [])
-    profiles = {mode: read_json(host.root / 'switch-profiles' / (mode + '.json')) for mode in MODES}
-    for mode in MODES:
+    profiles = {mode: read_json(host.root / 'switch-profiles' / (mode + '.json')) for mode in configured_modes(host)}
+    for mode in profiles:
         if signature == profile_signature(profiles[mode]):
             if not model.get('replicas') or cached == (mode != '1p1d-no-cache'):
                 return mode
@@ -229,7 +339,11 @@ def identify_mode(host, model):
         if mode not in MODES:
             raise SwitchError('旧方案登记包含未知方案。')
         for entry in entries:
-            if signature != entry['signature'] or (model.get('replicas') and cached != (mode != '1p1d-no-cache')):
+            legacy = copy.deepcopy(entry['signature'])
+            # 旧版签名未登记路径，只为其所属的已知模式补入固定路径；其他字段仍逐项比较。
+            legacy.setdefault('source', 'local_path')
+            legacy.setdefault('local_path', mode_model_path(host.config, mode))
+            if signature != legacy or (model.get('replicas') and cached != (mode != '1p1d-no-cache')):
                 continue
             reference, expected = entry['image_name'], entry['image_id']
             if host.config.get('image_ids', {}).get(reference) != expected:
@@ -266,7 +380,10 @@ def resolve_command(host, args):
     if requested in ('start', 'stop'):
         saved = host.root / 'model-state.json'
         current = host.call('GET', '/v2/models/' + str(host.config['model_id']))
-        if requested == 'start' and saved.exists():
+        pending = pending_start_mode(host) if requested == 'start' else None
+        if pending is not None:
+            args.mode = pending
+        elif requested == 'start' and saved.exists():
             args.mode = read_json(saved).get('last_mode')
         elif requested == 'start' and not current.get('replicas') and not saved.exists():
             # 首次启动采用环境输入中明确选择的方案；后续启动使用成功记录。
@@ -645,7 +762,7 @@ class Switch:
             role["extended_kv_cache"] = disabled_cache()
             if role["name"] == "prefill" and cache_id is not None:
                 role["extended_kv_cache"] = {"enabled": True, "mode": "shared",
-                    "cache_service_id": cache_id, "chunk_size": self.config["chunk_size"]}
+                    "cache_service_id": cache_id, "chunk_size": mode_chunk_size(self.config, self.state['target'])}
         # 保留原模型的故障重启策略，避免参数维护时意外启用局部自动重启。
         model.update(replicas=1, restart_on_error=bool(model.get("restart_on_error", False)), extended_kv_cache=disabled_cache())
         return model
@@ -756,7 +873,8 @@ class Switch:
         results["verification_level"] = "generation"
         # 默认思考不做覆盖；限制探测输出长度不改变生产默认 xhigh。
         data = {"model": self.config["model_name"], "messages": [{"role": "user", "content": "计算17+25，请给出结果。"}],
-                "max_tokens": 256, "temperature": 0}
+                # 默认xhigh需要完整结束思考再给出答案，不能用过短输出预算误判模型故障。
+                "max_tokens": 1024, "temperature": 0}
         started = time.monotonic()
         status, text = self.host.request("/v1/chat/completions", data, token=token, timeout=180)
         response = json.loads(text) if status == 200 else {}
@@ -779,7 +897,7 @@ class Switch:
             raise SwitchError("Responses 生成检查失败。")
         results["responses"] = {"passed": True}
         status, text = self.host.request('/v1/responses', {'model': self.config['model_name'],
-            'input': '计算17+25，只给出结果。', 'stream': True, 'max_output_tokens': 256,
+            'input': '计算17+25，只给出结果。', 'stream': True, 'max_output_tokens': 1024,
             'temperature': 0}, token=token, timeout=120)
         events = [json.loads(line[6:]) for line in text.splitlines()
             if line.startswith('data: ') and line[6:] != '[DONE]'] if status == 200 else []
@@ -796,7 +914,7 @@ class Switch:
             # 扩展验证读取本次私有快照中的维护条件，不把临时通行值放到命令行。
             # 只在明确选择扩展验证时执行；普通生产切换仍使用上面的短时功能检查。
             self.event("开始隔离条件下的上下文、并发和缓存扩展验证")
-            if self.state['target'] == '1p1d-cache':
+            if self.state['target'] in ('1p1d-cache', FP8_MODE):
                 self.host.run([sys.executable, str(self.root / 'verify-model-features.py'),
                     '--base', self.config['entry_url'], '--model', self.config['model_name'],
                     '--output', str(self.job / 'features.json'), '--switch-state', str(self.job / 'state.json')], timeout=600)
@@ -869,21 +987,39 @@ class Switch:
         # 配比模板保持不绑定缓存；通用恢复模板才描述当前真实缓存编号。
         for mode, name in (("1p1d-no-cache", "pd-model-1p1d-stopped.yaml"),
                            ("2p2d-cache", "pd-model-2p2d-stopped.yaml"),
-                           ("1p2d-6gpu-cache", "pd-model-1p2d-6gpu-stopped.yaml")):
+                           ("1p2d-6gpu-cache", "pd-model-1p2d-6gpu-stopped.yaml"),
+                           (FP8_MODE, "pd-model-1p1d-fp8-stopped.yaml")):
+            if mode not in configured_modes(self.host):
+                continue
             value = read_json(self.root / "switch-profiles" / (mode + ".json"))
             value["worker_selector"] = copy.deepcopy(model.get("worker_selector"))
             for role in value.get("roles") or []:
                 if role.get("worker_selector") is not None:
                     role["worker_selector"] = copy.deepcopy(model.get("worker_selector"))
             changed[name] = value
+        serialized = {}
         for name, value in changed.items():
             if name.endswith(".yaml"):
                 # YAML 顶层保留普通键，值使用标准 JSON 流式语法；不依赖额外 YAML 库，
                 # 同时兼容现有验证器按顶层 name 行生成只读校验名称的逻辑。
                 text = "".join(key + ": " + json.dumps(item, ensure_ascii=False) + "\n" for key, item in value.items())
-                atomic_file(self.root / name, text)
+                serialized[name] = text
             else:
-                write_json(self.root / name, value)
+                serialized[name] = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
+        # 发布声明与实际运行导出不同：写出前登记本事务计算的精确内容，
+        # 避免收尾验证将自身导出误判为外部维护，同时保留全部输入校验。
+        release = prepared_release_module(self.root)
+        if release is not None:
+            if hasattr(release, 'register_exports'):
+                release.register_exports(self.root, self.job.name, serialized)
+            else:
+                # 回滚可能已经恢复旧版恢复器；失败恢复完成后不再登记新版本导出。
+                # 仍处于当前激活过程却缺接口时拒绝写入，不能无保护地跳过校验。
+                plan = read_json(self.root / 'next-start-release.json')
+                if plan.get('activation_job') == self.job.name and plan['phase'] in ('activating', 'applied'):
+                    raise SwitchError('预备版本缺少运行导出登记接口')
+        for name, text in serialized.items():
+            atomic_file(self.root / name, text)
         sums = self.root / "SHA256SUMS"
         if sums.exists():
             updated = []
@@ -900,7 +1036,7 @@ class Switch:
         current = read_json(self.job / "model-before.json")
         if current.get("replicas") != 1:
             return False
-        for field in ("image_name", "env", "backend", "backend_version", "run_command",
+        for field in ("source", "local_path", "image_name", "env", "backend", "backend_version", "run_command",
                       "distributed_inference_across_workers", "cpu_offloading", "gpu_selector", "gpu_type_selector"):
             if current.get(field) != wanted.get(field):
                 return False
@@ -1097,17 +1233,22 @@ def preflight(host, target, operation="switch"):
         if hashlib.sha256((host.root / name).read_bytes()).hexdigest() != expected:
             raise SwitchError("依赖工具已变化，需要重新验证：" + name)
     model = host.call("GET", "/v2/models/" + str(config["model_id"]))
-    if model.get("name") != config["model_name"] or model.get("local_path") != config["model_path"]:
+    known_paths = {mode_model_path(config, mode) for mode in configured_modes(host)}
+    if model.get("name") != config["model_name"] or model.get('source') != 'local_path' or model.get("local_path") not in known_paths:
         raise SwitchError("当前模型身份与这套固定配置不符，不能套用旧模型参数。")
     if model.get("scaling_schedule"):
         raise SwitchError("模型设置了定时伸缩，需先在网页关闭，以免干扰维护。")
     if (model.get("extended_kv_cache") or {}).get("enabled") or any(
         (r.get("extended_kv_cache") or {}).get("enabled") for r in model.get("roles") or [] if r["name"] != "prefill"):
         raise SwitchError("当前缓存并非仅关联 P，不能用此固定流程修改。")
+    if target not in configured_modes(host):
+        raise SwitchError('目标模式尚未提供模型目录或完整配置：' + target)
     profile_path = host.root / "switch-profiles" / (target + ".json")
     if hashlib.sha256(profile_path.read_bytes()).hexdigest() != config["profile_sha256"][target]:
         raise SwitchError("目标配置散列不符，请恢复正式脚本包，不能继续。")
     profile = read_json(profile_path)
+    if operation != 'stop':
+        validate_model_inputs(host, target, profile)
     roles = {r["name"]: r for r in profile["roles"]}
     shape = MODE_SHAPES[target]
     if set(roles) != {"prefill", "decode", "router"} or roles["router"]["replicas"] != 1:
@@ -1144,6 +1285,25 @@ def preflight(host, target, operation="switch"):
                 raise SwitchError('角色候选卡池不足以给全部副本分配独立显卡：' + name)
         if flags.get("--speculative-config", {}).get("num_speculative_tokens") != 3 or flags.get("--default-chat-template-kwargs", {}).get("reasoning_effort") != "xhigh":
             raise SwitchError("MTP3 或默认 xhigh 配置不完整。")
+        if target == FP8_MODE and (flags.get('--kv-cache-dtype') != 'fp8_e4m3'
+                or flags.get('--quantization') != 'fp8' or flags.get('--mamba-ssm-cache-dtype') != 'bfloat16'
+                or flags.get('--calculate-kv-scales')):
+            raise SwitchError('FP8权重、静态FP8 KV或BF16 Mamba配置不一致')
+    # NIXL只搬运KV页，不校正两个实例各自计算的标量尺度；两阶段布局必须一致。
+    if target == FP8_MODE:
+        pflags, dflags = (parse_options(roles[r]['backend_parameters']) for r in ('prefill', 'decode'))
+        if any(pflags.get(k) != dflags.get(k) for k in ('--max-model-len', '--kv-cache-dtype', '--block-size', '--mamba-block-size',
+                '--mamba-cache-mode', '--mamba-ssm-cache-dtype', '--speculative-config', '--tensor-parallel-size')):
+            raise SwitchError('FP8方案的P/D缓存或MTP布局不一致')
+        chunk = mode_chunk_size(config, target)
+        # HMA使用同一管理块跟踪注意力与GDN；共享缓存chunk必须完整覆盖该块。
+        # 同时核对顶层，避免角色继承或手工导入重新带回旧的1536。
+        for scope in (profile, roles['prefill'], roles['decode']):
+            flags = parse_options(scope['backend_parameters'])
+            block = flags.get('--block-size')
+            if (not str(block).isdigit() or int(block) <= 0 or chunk % int(block)
+                    or flags.get('--mamba-block-size') != block):
+                raise SwitchError('FP8缓存块、GDN块与本模式CPU分块不对齐')
     cache_path = host.root / "cache-service.json"
     if hashlib.sha256(cache_path.read_bytes()).hexdigest() != config["cache_definition_sha256"]:
         raise SwitchError("缓存定义散列不符，不能继续使用未经验证的内存容量或布局。")
@@ -1218,6 +1378,9 @@ def preflight(host, target, operation="switch"):
 def prepare_job(host, args):
     """在任何模型修改之前冻结原配置，事务目录与快照均为 root 私有。"""
     initial = preflight(host, args.mode, getattr(args, 'operation', 'switch'))
+    # 跨权重切换必须完整排空；超时取消并恢复入口，不能沿用旧模式的超时强停行为。
+    if getattr(args, 'operation', 'switch') != 'stop' and initial['model'].get('local_path') != initial['profile'].get('local_path'):
+        args.require_drained = True
     # 首次应用预备版本必须排空，不能因调用者漏写选项而中断等待中的长请求。
     prepared = prepared_release_module(host.root)
     if prepared is not None and getattr(args, 'operation', 'switch') != 'stop':
@@ -1245,6 +1408,9 @@ def prepare_job(host, args):
     definition = read_json(host.root / "cache-service.json")
     definition["cluster_id"] = initial["model"]["cluster_id"]
     definition["worker_selector"] = initial["model"]["worker_selector"]
+    # 默认缓存文件保留原NVFP4布局；只在事务副本中应用目标模式的chunk。
+    # 运行中的CPU池不受准备文件变化影响，回滚使用独立保存的旧池定义。
+    definition['config']['fields']['chunk_size'] = mode_chunk_size(host.config, args.mode)
     # CPU共享池只被P使用，其CUDA上下文和CPU亲和性只需覆盖本方案P的显卡。
     # 卡号来自正式选择器，并检查属于本次授权集合，不能在这里写死某台机器的布局。
     p_role = next(r for r in initial['profile']['roles'] if r['name'] == 'prefill')
@@ -1308,6 +1474,12 @@ def status(root, show_log=True):
     """只读显示持久化方案和最后事务，隐藏维护探测的临时通行值。"""
     if (Path(root) / 'model-state.json').exists():
         print(json.dumps(read_json(Path(root) / 'model-state.json'), ensure_ascii=False, indent=2))
+    marker = Path(root) / 'next-start-release.json'
+    if marker.exists():
+        plan = read_json(marker)
+        # 准备状态与最后成功模式分开显示，不把未启动的FP8配置当成当前实际服务。
+        print(json.dumps({'next_start': {k: plan[k] for k in
+              ('phase', 'target_mode', 'runtime_image', 'gpu_inference_verified') if k in plan}}, ensure_ascii=False, indent=2))
     pointer = Path(root) / "baks/pd-switch/LAST.json"
     if not pointer.exists():
         print("尚无切换记录。")

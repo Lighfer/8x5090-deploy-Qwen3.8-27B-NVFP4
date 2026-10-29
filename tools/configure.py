@@ -14,7 +14,8 @@ import sys
 sys.dont_write_bytecode = True
 from repository_common import ROOT, read_json, outside_repository, safe_path
 
-MODES = ('1p1d-cache', '1p1d-no-cache', '2p2d-cache', '1p2d-6gpu-cache')
+FP8_MODE = '1p1d-cache-fp8'
+MODES = ('1p1d-cache', '1p1d-no-cache', '2p2d-cache', '1p2d-6gpu-cache', FP8_MODE)
 INTERNAL_PATHS = {
     'server_data': '/var/lib/gpustack',
     'docker_socket': '/var/run/docker.sock',
@@ -22,6 +23,11 @@ INTERNAL_PATHS = {
     'cgroup': '/sys/fs/cgroup',
 }
 TOP_KEYS = {'format', 'host', 'paths', 'ports', 'names', 'gpus', 'resources', 'images', 'identity', 'admin_user', 'default_mode'}
+
+
+def enabled_modes(site):
+    """只有明确提供FP8目录才生成新模式，旧环境输入继续生成原有四种方案。"""
+    return MODES if site['paths'].get('fp8_model_directory') else tuple(m for m in MODES if m != FP8_MODE)
 
 
 def require_keys(value, expected, label):
@@ -43,14 +49,23 @@ def checked_site(path):
         raise ValueError('host.kind必须明确为lxc或baremetal')
     if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,32}', site['host']['interface'] or ''):
         raise ValueError('必须提供实际网络接口名称')
-    require_keys(site['paths'], {'deployment', 'model_parent', 'model_directory'}, 'paths')
-    for value in site['paths'].values():
+    path_keys = {'deployment', 'model_parent', 'model_directory'}
+    if 'fp8_model_directory' in site['paths']:
+        path_keys.add('fp8_model_directory')
+    require_keys(site['paths'], path_keys, 'paths')
+    for key, value in site['paths'].items():
+        if key == 'fp8_model_directory' and value is None:
+            continue
         if not isinstance(value, str) or not PurePosixPath(value).is_absolute() or any(c in value for c in '\n\r\x00'):
             raise ValueError('目标目录必须是明确的Linux绝对路径')
     parent = PurePosixPath(site['paths']['model_parent'])
     model = PurePosixPath(site['paths']['model_directory'])
     if not model.is_relative_to(parent) or model == parent:
         raise ValueError('模型目录必须位于明确提供的模型父目录下')
+    if site['paths'].get('fp8_model_directory'):
+        fp8 = PurePosixPath(site['paths']['fp8_model_directory'])
+        if not fp8.is_relative_to(parent) or fp8 in (parent, model):
+            raise ValueError('FP8必须使用同一模型父目录下的独立目录，不能覆盖NVFP4权重')
     target = outside_repository(site['paths']['deployment'])
     # systemd会对ExecStart中的美元变量做自己的展开，安装目录明确拒绝这种歧义。
     # 模型目录不进入ExecStart，仍通过JSON与Compose环境文件保留其原始字符。
@@ -102,7 +117,7 @@ def checked_site(path):
         raise ValueError('资源编号必须是实际非负整数，初次准备统一使用0')
     if not isinstance(site['admin_user'], str) or not re.fullmatch(r'[A-Za-z0-9_.@-]{1,128}', site['admin_user']):
         raise ValueError('必须提供实际管理员用户名；不包含密码')
-    if site['default_mode'] not in MODES:
+    if site['default_mode'] not in enabled_modes(site):
         raise ValueError('必须明确选择默认方案')
     return site, target
 
@@ -155,7 +170,8 @@ def model_values(site, mode):
     order = site['gpus']['six_card_order' if mode == '1p2d-6gpu-cache' else 'eight_card_order']
     split = 2 if mode == '1p2d-6gpu-cache' else 4
     prefix = site['names']['node'] + ':cuda:'
-    return {'MODEL_NAME': site['names']['model'], 'MODEL_DIR': site['paths']['model_directory'],
+    directory = site['paths']['fp8_model_directory'] if mode == FP8_MODE else site['paths']['model_directory']
+    return {'MODEL_NAME': site['names']['model'], 'MODEL_DIR': directory,
             'RUNTIME_IMAGE': site['images']['runtime'], 'ROUTER_IMAGE': site['images']['router'],
             'WORKER_NAME': site['names']['node'], 'WORKER_LABEL': site['names']['worker_label'], 'CLUSTER_NAME': site['names']['cluster'],
             'PREFILL_GPU_IDS': [prefix + str(i) for i in order[:split]],
@@ -224,16 +240,32 @@ def generated_files(site, target, image_ids):
         'CACHE_GPU_IDS': ','.join(map(str, sorted(site['gpus']['eight_card_order'])))})
     cache['cluster_id'] = site['identity']['cluster_id']
     result['cache-service.json'] = bytes_json(cache)
-    hashes, mode_gpus = {}, {}
+    hashes, mode_gpus, mode_models, model_locks, mode_chunks = {}, {}, {}, {}, {}
     names = {'1p1d-cache': 'pd-model-stopped', '1p1d-no-cache': 'pd-model-1p1d-stopped',
-             '2p2d-cache': 'pd-model-2p2d-stopped', '1p2d-6gpu-cache': 'pd-model-1p2d-6gpu-stopped'}
-    for mode in MODES:
+             '2p2d-cache': 'pd-model-2p2d-stopped', '1p2d-6gpu-cache': 'pd-model-1p2d-6gpu-stopped',
+             FP8_MODE: 'pd-model-1p1d-fp8-stopped'}
+    for precision, lock_name in [('nvfp4', 'model-downloads.json'), ('fp8', 'model-downloads-fp8.json')]:
+        if precision == 'fp8' and FP8_MODE not in enabled_modes(site):
+            continue
+        relative = 'model-inputs/' + precision + '.json'
+        result[relative] = (ROOT / 'locks' / lock_name).read_bytes()
+        model_locks[precision] = hashlib.sha256(result[relative]).hexdigest()
+    for mode in enabled_modes(site):
         profile = replace_values(read_json(ROOT / 'recipes' / (mode + '.json')), model_values(site, mode))
         apply_numa_binding(profile, site['gpus'].get('numa_nodes'))
         data = bytes_json(profile)
         result['switch-profiles/' + mode + '.json'] = data
         hashes[mode] = hashlib.sha256(data).hexdigest()
         mode_gpus[mode] = list(site['gpus']['six_card_order' if mode == '1p2d-6gpu-cache' else 'eight_card_order'])
+        mode_models[mode] = profile['local_path']
+        # 分块来自各模式的正式配方。FP8与NVFP4可以采用不同页面大小，不能
+        # 沿用一个全局chunk，否则重建CPU池后仍会与目标P的缓存块不整除。
+        p_role = next(role for role in profile['roles'] if role['name'] == 'prefill')
+        p_blocks = [int(arg.split('=', 1)[1]) for arg in p_role['backend_parameters']
+                    if arg.startswith('--block-size=')]
+        if len(p_blocks) != 1 or p_blocks[0] <= 0:
+            raise ValueError('方案必须明确提供唯一正整数缓存块大小：' + mode)
+        mode_chunks[mode] = p_blocks[0]
         result[names[mode] + '.json'] = data
     result['pd-model-new-stopped.json'] = result['switch-profiles/' + site['default_mode'] + '.json']
     configuration = {'format': 1, 'model_id': site['identity']['model_id'], 'model_name': site['names']['model'],
@@ -242,11 +274,13 @@ def generated_files(site, target, image_ids):
         'proxy_container': site['names']['proxy'], 'server_container': site['names']['server'],
         'worker_container': site['names']['worker'], 'worker_name': site['names']['node'],
         'cache_name': site['names']['cache'], 'cache_gib': site['resources']['cache_gib'],
-        'chunk_size': 1536, 'minimum_free_gib': site['resources']['minimum_free_gib'],
+        'chunk_size': 1536, 'mode_chunk_sizes': mode_chunks,
+        'minimum_free_gib': site['resources']['minimum_free_gib'],
         'stop_timeout': 300, 'cache_timeout': 600, 'start_timeout': 1200,
         'profile_sha256': hashes, 'cache_definition_sha256': hashlib.sha256(result['cache-service.json']).hexdigest(),
         'image_ids': image_ids, 'production_root': str(target), 'source_repository': str(ROOT),
         'mode_gpu_ids': mode_gpus, 'hardware_gpu_ids': sorted(site['gpus']['eight_card_order']),
+        'mode_model_paths': mode_models, 'model_lock_sha256': model_locks,
         'previous_runtime_images': {}, 'control_plane_images': {}, 'helper_sha256': {},
         'initial_mode': site['default_mode']}
     for name in ('gpustack-local-api.py', 'entrypoint/sync-upstream.py', 'verify-live-parameters.py', 'verify-v032-migration.py', 'verify-model-features.py'):

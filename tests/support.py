@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import ipaddress
+import json
 from pathlib import Path
 import secrets
 import sys
@@ -27,7 +28,8 @@ def fake_site(base, *, shifted=False):
         'project', 'server', 'worker', 'proxy', 'cluster', 'node', 'worker_label', 'model', 'cache', 'server_volume', 'worker_volume')}
     return {'format': 1, 'host': {'address': host, 'interface': identity, 'kind': 'lxc'},
         'paths': {'deployment': str(base / 'private deployment'), 'model_parent': str(base / 'models'),
-                  'model_directory': str(base / 'models/model')},
+                  'model_directory': str(base / 'models/model'),
+                  'fp8_model_directory': str(base / 'models/model-fp8')},
         'ports': {'management': start, 'inference': start + 1, 'worker_api': start + 2,
                   'worker_metrics': start + 3, 'service_start': start + 100, 'service_end': start + 199},
         'names': names, 'gpus': {'eight_card_order': gpus, 'six_card_order': gpus[:6]},
@@ -48,10 +50,37 @@ def generated_fixture(root):
     """生成隔离管理器夹具；这里的编号是测试协议中的合成资源，不是现场编号。"""
     site = fake_site(Path(root).parent)
     site['paths']['deployment'] = str(root)
+    # 模型文件只使用当前临时安装目录中的合成内容，不创建真实权重或共享临时目录。
+    site['paths'].update(model_parent=str(Path(root) / 'fixture-models'),
+                         model_directory=str(Path(root) / 'fixture-models/nvfp4'),
+                         fp8_model_directory=str(Path(root) / 'fixture-models/fp8'))
     site['identity'] = {'model_id': 1, 'worker_id': 1, 'cluster_id': 1}
     files = configure.generated_files(site, Path(root), fake_images(site))
     for name, content in files.items():
         path = Path(root) / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
+    configuration = configure.read_json(Path(root) / 'switch-config.json')
+    for precision in ('nvfp4', 'fp8'):
+        directory = Path(site['paths']['fp8_model_directory' if precision == 'fp8' else 'model_directory'])
+        directory.mkdir(parents=True)
+        quant = {'quant_method': 'fp8', 'weight_block_size': [128, 128]} if precision == 'fp8' else {'quant_method': 'modelopt'}
+        config = {'quantization_config': quant, 'text_config': {'intermediate_size': 17408,
+                  'num_key_value_heads': 4, 'max_position_embeddings': 262144}}
+        metadata = {'config.json': config, 'model.safetensors.index.json': {'weight_map': {'model.weight': 'model.safetensors', 'mtp.weight': 'model.safetensors'}}}
+        for name in ('generation_config.json', 'tokenizer.json', 'tokenizer_config.json', 'vocab.json',
+                     'merges.txt', 'preprocessor_config.json', 'video_preprocessor_config.json', 'chat_template.jinja'):
+            metadata[name] = {}
+        rows = []
+        for name, value in metadata.items():
+            data = json.dumps(value).encode()
+            (directory / name).write_bytes(data)
+            rows.append({'path': name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+        data = b'synthetic-weights'
+        (directory / 'model.safetensors').write_bytes(data)
+        rows.append({'path': 'model.safetensors', 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+        lock = (json.dumps({'files': rows}) + '\n').encode()
+        (Path(root) / 'model-inputs' / (precision + '.json')).write_bytes(lock)
+        configuration['model_lock_sha256'][precision] = hashlib.sha256(lock).hexdigest()
+    (Path(root) / 'switch-config.json').write_text(json.dumps(configuration))
     return site

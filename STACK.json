@@ -6,7 +6,10 @@
   "flashinfer": "0.7.2.post1",
   "lmcache": "0.5.6",
   "lmcache_cuda_rebuild": {
-    "components": ["lmcache.cuda_ops", "lmcache.lmcache_native"],
+    "components": [
+      "lmcache.cuda_ops",
+      "lmcache.lmcache_native"
+    ],
     "source_sha256": "d6951e60ce8818a76aa42d0866a4ba85f1c95cd919355fff30ff24dcc3243f1e",
     "torch": "2.14.0+cu130",
     "architecture": "12.0",
@@ -56,5 +59,39 @@
       6371
     ],
     "gpu_performance_verified": false
+  },
+  "lookup_progress_fix": {
+    "name": "lmcache-result-progress-20261028",
+    "manifest": "sources/vllm/lookup-progress/manifest.json",
+    "source": "local fix; pinned LMCache 0.5.6",
+    "callback": "LMCacheMPConnector.build_connector_meta",
+    "max_requests_per_step": 64,
+    "soft_time_budget_ms": 1,
+    "prefill_long_request_threshold": 1536,
+    "gpu_performance_verified": false
+  },
+  "model_variants": {
+    "nvfp4": {
+      "lock": "locks/model-downloads.json",
+      "kv_cache_dtype": "nvfp4",
+      "existing_profiles_preserved": true
+    },
+    "fp8": {
+      "repository": "Qwen/Qwen3.8-27B-FP8",
+      "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+      "lock": "locks/model-downloads-fp8.json",
+      "mode": "1p1d-cache-fp8",
+      "kv_cache_dtype": "fp8_e4m3",
+      "mamba_ssm_cache_dtype": "bfloat16",
+      "kv_scale_policy": "identical-static-default-1.0-no-runtime-calibration",
+      "cache_block_size": 1024,
+      "cpu_chunk_size": 1024,
+      "common_max_model_len": 262144,
+      "kv_calibration_completed": false,
+      "kv_calibration_fallback": "no-reliable-isolated-calibration; use official static default 1.0",
+      "layout_analysis_tool": "tools/analyze-fp8-layout.py",
+      "requires_site_gpu_acceptance": true,
+      "acceptance_results_location": "outside_source_repository"
+    }
   }
 }

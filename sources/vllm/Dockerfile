@@ -28,6 +28,12 @@ COPY lmcache-cuda/ /opt/gpustack-v032/lmcache-cuda/
 COPY lmcache-0.5.6.tar.gz /opt/gpustack-v032/lmcache-cuda/
 RUN NVIDIA_VISIBLE_DEVICES=void CUDA_VISIBLE_DEVICES=-1 TORCH_CUDA_ARCH_LIST=12.0 MAX_JOBS=1 NVCC_THREADS=1 ENABLE_CXX11_ABI=1 python3 /opt/gpustack-v032/lmcache-cuda/build-lmcache-cuda.py
 
+# LMCache源码安装完成后再应用纯Python查询推进修复，避免重建扩展时覆盖补丁。
+# 元数据回调不受本轮计算预算限制；CPU验证不连接生产缓存或初始化CUDA。
+COPY lookup-progress/ /opt/gpustack-v032/lookup-progress/
+RUN python3 -B /opt/gpustack-v032/lookup-progress/apply-patch.py --execute && \
+    python3 -B /opt/gpustack-v032/lookup-progress/verify-cpu.py
+
 # 最终镜像由GPUStack按角色提供设备限制；不把构建时的屏蔽值带入运行配置。
 ENV NVIDIA_VISIBLE_DEVICES=all
 LABEL local.gpustack.purpose="Qwen3.8-27B SM120 native NVFP4 KV + MTP + NIXL/LMCache" \
@@ -35,4 +41,5 @@ LABEL local.gpustack.purpose="Qwen3.8-27B SM120 native NVFP4 KV + MTP + NIXL/LMC
       local.gpustack.patch-scope="nixl-malformed-handshake-guard,flashinfer-6204,upstream-backports-20261028" \
       local.gpustack.optimization-release="e4a5b5537-opt-20261028" \
       local.gpustack.lmcache-cuda-abi="torch-2.14.0-cu130-sm120" \
+      local.gpustack.lookup-progress="lmcache-result-progress-20261028" \
       local.gpustack.flashinfer-commit="3821440929ee342fe9f939dbf5186c3e667a851c"

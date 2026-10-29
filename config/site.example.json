@@ -8,7 +8,8 @@
   "paths": {
     "deployment": null,
     "model_parent": null,
-    "model_directory": null
+    "model_directory": null,
+    "fp8_model_directory": null
   },
   "ports": {
     "management": null,

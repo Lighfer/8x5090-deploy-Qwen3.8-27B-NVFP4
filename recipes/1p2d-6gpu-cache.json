@@ -111,7 +111,9 @@
         "--mm-processor-kwargs={\"images_kwargs\":{\"size\":{\"shortest_edge\":65536,\"longest_edge\":1048576}}}",
         "--mm-encoder-tp-mode=weights",
         "--mm-processor-device=cpu",
-        "--no-skip-mm-profiling"
+        "--no-skip-mm-profiling",
+        "--long-prefill-token-threshold=1536",
+        "--long-prefill-token-threshold-adaptive"
       ],
       "extended_kv_cache": {
         "enabled": false
